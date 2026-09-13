@@ -139,6 +139,11 @@ class Settings:
     answer_mode: str = "NORMAL"           # SHORT | NORMAL | DETAILED
     font_size: int = 13
     always_on_top: bool = True
+    # The latency readout is useful while tuning and clutter once you trust it.
+    # Turning it off only hides the label - the numbers still go to app.log.
+    show_latency: bool = True
+    # The "heard: ..." line under the question, showing the raw transcript.
+    show_transcript: bool = True
 
     # ---- Misc ------------------------------------------------------------
     save_audio: bool = False              # privacy: off by default
@@ -190,6 +195,8 @@ class Settings:
             answer_mode=_env("ANSWER_MODE", "NORMAL").upper(),
             font_size=_env_int("FONT_SIZE", 13),
             always_on_top=_env_bool("ALWAYS_ON_TOP", True),
+            show_latency=_env_bool("SHOW_LATENCY", True),
+            show_transcript=_env_bool("SHOW_TRANSCRIPT", True),
             save_audio=_env_bool("SAVE_AUDIO", False),
             log_level=_env("LOG_LEVEL", "INFO").upper(),
             hotkeys_enabled=_env_bool("HOTKEYS_ENABLED", True),

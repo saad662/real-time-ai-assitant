@@ -206,8 +206,14 @@ class MainWindow(QWidget):
 
         # -- footer --------------------------------------------------------
         footer = QHBoxLayout()
-        self.latency_label = MutedLabel("Latency: -")
-        footer.addWidget(self.latency_label, 1)
+        self.latency_label = MutedLabel("")
+        if self.settings.show_latency:
+            self.latency_label.setText("Latency: -")
+            footer.addWidget(self.latency_label, 1)
+        else:
+            # Keep the buttons right-aligned now that the label is gone.
+            self.latency_label.hide()
+            footer.addStretch(1)
 
         self.clear_button = QPushButton("Clear")
         self.clear_button.setToolTip("Clear the answer and conversation memory (Ctrl+Shift+C)")
@@ -440,10 +446,14 @@ class MainWindow(QWidget):
         self.level_meter.update_level(event.rms_db, event.noise_floor_db, event.is_speech)
 
     def _on_partial(self, event: ev.PartialTranscript) -> None:
-        self.partial_label.setText("… %s" % event.text)
+        # Warnings and the early-answer notice still use this label, so only
+        # the transcript itself is suppressed.
+        if self.settings.show_transcript:
+            self.partial_label.setText("… %s" % event.text)
 
     def _on_final(self, event: ev.FinalTranscript) -> None:
-        self.partial_label.setText("heard: %s" % event.text)
+        if self.settings.show_transcript:
+            self.partial_label.setText("heard: %s" % event.text)
 
     def _on_question(self, event: ev.QuestionDetected) -> None:
         self._provisional = event.speculative
@@ -493,7 +503,9 @@ class MainWindow(QWidget):
             self._scroll_to_bottom()
 
     def _on_latency(self, event: ev.LatencyReport) -> None:
-        self.latency_label.setText("Latency:  %s" % event.as_line())
+        # Always logged by the pipeline; only shown if asked for.
+        if self.settings.show_latency:
+            self.latency_label.setText("Latency:  %s" % event.as_line())
 
     def _on_error(self, event: ev.ErrorEvent) -> None:
         self._append_notice(event.message)
