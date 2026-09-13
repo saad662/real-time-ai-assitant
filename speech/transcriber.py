@@ -7,12 +7,15 @@ Two providers, one interface:
   utterance from its start* every PARTIAL_INTERVAL seconds. Re-decoding is
   wasteful, but it is far more accurate than stitching independently decoded
   fragments together, because Whisper sees the whole utterance every time.
-  Measured on a Ryzen 7 PRO 4750U: `tiny.en` + int8 decodes a 2.8 s utterance
-  in ~0.85 s, `base.en` in ~1.7 s. That cost is on the critical path, which is
-  why `tiny.en` is the default and why Deepgram is worth a key if you have one.
+  Measured warm on a Ryzen 7 PRO 4750U: `tiny.en` + int8 decodes a 2.8 s
+  utterance in ~390 ms, `base.en` in ~745 ms. That cost no longer sits on the
+  critical path - core/pipeline.py starts the decode during the speaker's
+  pause - but it is still real CPU work, which is why `tiny.en` is the default.
 
-* DeepgramTranscriber - a genuine streaming model over a WebSocket. Lower
-  latency (~150-300 ms interims) and no CPU cost, but needs a key and network.
+* DeepgramTranscriber - a genuine streaming model over a WebSocket. Interims
+  in ~150-300 ms and no local CPU at all, but needs a key and a network. Its
+  `speech_final` marker drives the same early-answer path that the local
+  pause decode does. Verified against a mock server in tests/test_deepgram.py.
 
 Both run their work on their own thread and report through callbacks. Partial
 jobs are *coalescing*: if a decode is still running when the next partial is
@@ -22,6 +25,7 @@ never fall behind real time.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import queue
@@ -349,10 +353,9 @@ class DeepgramTranscriber(BaseTranscriber):
     """
 
     name = "deepgram"
-    _URL = (
-        "wss://api.deepgram.com/v1/listen"
+    _QUERY = (
         "?model={model}&encoding=linear16&sample_rate={rate}&channels=1"
-        "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
+        "&interim_results=true&punctuate=true&smart_format=true&endpointing={endpointing}"
     )
 
     def __init__(self, settings: Settings, **callbacks) -> None:
@@ -374,16 +377,32 @@ class DeepgramTranscriber(BaseTranscriber):
         self._thread.start()
 
     def stop(self) -> None:
+        """Close the socket first, then the loop.
+
+        Stopping the loop outright leaves the send/finalize coroutines pending
+        and asyncio complains loudly during interpreter teardown, so we ask the
+        connection to close and give it a moment to unwind first.
+        """
         self._running.clear()
         loop, self._loop = self._loop, None
-        if loop is not None:
-            try:
-                loop.call_soon_threadsafe(loop.stop)
-            except Exception:
-                pass
+        if loop is None:
+            return
+
+        # Always run this, even with no live socket: sends scheduled while the
+        # connection was dropping are still queued on the loop.
+        try:
+            asyncio.run_coroutine_threadsafe(self._shutdown(), loop).result(timeout=2.0)
+        except Exception:
+            log.debug("Deepgram did not shut down cleanly", exc_info=True)
+
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
         thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=3.0)
+        self._connected.clear()
 
     def begin_utterance(self, utterance_id: int) -> None:
         self._active_utterance = utterance_id
@@ -407,7 +426,6 @@ class DeepgramTranscriber(BaseTranscriber):
 
     # -- asyncio plumbing --------------------------------------------------
     def _submit(self, coro) -> None:
-        import asyncio
         loop = self._loop
         if loop is None or not self._running.is_set():
             coro.close()
@@ -418,7 +436,6 @@ class DeepgramTranscriber(BaseTranscriber):
             coro.close()
 
     def _run_loop(self) -> None:
-        import asyncio
         try:
             import websockets  # noqa: F401
         except Exception as exc:
@@ -434,6 +451,11 @@ class DeepgramTranscriber(BaseTranscriber):
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._connect_and_listen())
+        except asyncio.CancelledError:
+            # Expected: stop() cancels the listener. CancelledError derives from
+            # BaseException, not Exception, so without this it escapes the
+            # thread and is reported as an unhandled thread exception.
+            log.debug("Deepgram listener cancelled during shutdown")
         except Exception:
             log.exception("Deepgram loop ended")
         finally:
@@ -447,8 +469,13 @@ class DeepgramTranscriber(BaseTranscriber):
         import json
         import websockets
 
-        url = self._URL.format(model=self.settings.deepgram_model, rate=SAMPLE_RATE)
-        headers = {"Authorization": "Token %s" % self.settings.deepgram_api_key}
+        s = self.settings
+        url = s.deepgram_url.rstrip("/") + self._QUERY.format(
+            model=s.deepgram_model, rate=SAMPLE_RATE,
+            endpointing=s.deepgram_endpointing,
+        )
+        headers = {"Authorization": "Token %s" % s.deepgram_api_key}
+        log.info("Connecting to %s", s.deepgram_url)
 
         while self._running.is_set():
             try:
@@ -477,7 +504,6 @@ class DeepgramTranscriber(BaseTranscriber):
                     return
                 log.warning("Deepgram connection lost: %s; reconnecting in 2s", exc)
                 self.on_error("Deepgram connection lost, reconnecting...")
-                import asyncio
                 await asyncio.sleep(2.0)
 
     def _handle_message(self, message: dict) -> None:
@@ -508,9 +534,26 @@ class DeepgramTranscriber(BaseTranscriber):
         if message.get("speech_final") and combined:
             self.on_prefinal(combined, uid, -1)
 
+    async def _shutdown(self) -> None:
+        """Close the socket and drop any audio still queued for sending.
+
+        Without this, sends scheduled just before Stop outlive the loop and
+        asyncio reports them as destroyed-while-pending during teardown.
+        """
+        ws, self._ws = self._ws, None
+        current = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            if task is not current:
+                task.cancel()
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                log.debug("Deepgram close failed", exc_info=True)
+
     async def _send(self, payload: bytes) -> None:
         ws = self._ws
-        if ws is None:
+        if ws is None or not self._running.is_set():
             return
         try:
             await ws.send(payload)
@@ -518,7 +561,6 @@ class DeepgramTranscriber(BaseTranscriber):
             log.debug("Deepgram send failed", exc_info=True)
 
     async def _finalize(self, uid: int) -> None:
-        import asyncio
         import json
         ws = self._ws
         if ws is not None:

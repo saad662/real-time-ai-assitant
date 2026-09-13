@@ -349,9 +349,10 @@ moves but no utterances are detected, lower `VAD_THRESHOLD_DB`.
 pytest -q
 ```
 
-81 tests covering duplicate suppression, question detection, conversation
-context, configuration, latency measurement, VAD segmentation, resampling and
-error handling. They need no API key, no audio device and no network.
+95 tests covering duplicate suppression, question detection, conversation
+context, configuration, latency measurement, VAD segmentation and pause
+decoding, resampling, error handling, and the Deepgram streaming client
+(against a mock server). They need no API key, no audio device and no network.
 
 ---
 
@@ -496,30 +497,61 @@ Warm decode of a 2.8 s utterance:
 long question is no more expensive than a short one, and `base.en` is perfectly
 usable now that the decode is hidden inside the silence window.
 
+### Knobs that turned out not to matter
+
+Worth stating plainly, because it saves you fiddling with them. Measured across
+three runs each, on the same audio:
+
+| `END_OF_UTTERANCE_SILENCE` / `PAUSE_DECODE_AFTER` | best |
+|---|---|
+| 0.70 / 0.20 *(default)* | 782 ms |
+| 0.50 / 0.20 | 801 ms |
+| 0.40 / 0.20 | 778 ms |
+| 0.70 / 0.12 | 810 ms |
+| 0.50 / 0.12 | 771 ms |
+| 0.70 / 0.06 | 777 ms |
+
+Everything lands inside the noise. Once the decode runs during the pause, the
+binding constraint is **the decode itself**, not either timer — so lowering the
+silence window just buys truncation risk for nothing. Tracing confirmed it:
+
+```
+-279 ms  partial queued              <- a routine partial is still running
++203 ms  VAD emits SpeechPause       <- pause decode queued, but must wait
++250 ms  decode END                  <- partial finishes
++251 ms  decode START (full, 2.0s)
++852 ms  decode END                  <- ~600 ms under real load, not the 390 ms
++852 ms  LLM request sent               measured in isolation
+```
+
+An attempt to fix the contention — spacing partials adaptively at twice the
+measured decode time — was **measured and reverted**: median 942 ms against
+847 ms for the fixed interval. It made things worse, so it is not in the code.
+
 ### Squeezing out the rest
 
-The dominant remaining cost is the 700 ms silence window itself — that is the
-price of not cutting people off mid-sentence.
-
-1. **`STT_PROVIDER=deepgram`.** A genuine streaming model with ~300 ms
-   endpointing and zero local CPU. Its `speech_final` signal drives speculation
-   the same way the local pause decode does. Needs a key from
-   <https://deepgram.com>:
+1. **`STT_PROVIDER=deepgram` — the one that actually moves the needle.** It
+   removes local transcription entirely: nothing is decoded on your CPU, and
+   interims arrive in 150–300 ms. Its server-side `speech_final` marker drives
+   the same early-answer path the local pause decode does, and its endpointing
+   (`DEEPGRAM_ENDPOINTING=300`) can be far tighter than the local 700 ms
+   because it runs on a real streaming model rather than an energy threshold.
+   Needs a key from <https://deepgram.com>:
    ```
    STT_PROVIDER=deepgram
    DEEPGRAM_API_KEY=...
    ```
-2. **Lower `END_OF_UTTERANCE_SILENCE`** to `0.5`. Directly removes 200 ms. This
-   is now the single biggest remaining lever, and the cost is occasionally
-   cutting someone off mid-question.
-3. **Lower `PAUSE_DECODE_AFTER`** to `0.12`. Starts the decode sooner so
-   speculation can fire earlier. Costs some wasted decodes on mid-sentence
-   pauses; correctness is unaffected.
-4. **Keep `SPECULATIVE_START=true`.** Worth ~80 ms on top.
-5. **Lower `CONTEXT_TURNS`** to `2–3`. Fewer prompt tokens, slightly faster
+   The streaming client is verified against a mock Deepgram server in
+   `tests/test_deepgram.py` — URL and auth, PCM encoding, interim accumulation,
+   `speech_final` → early answer, `Finalize` → final, and reconnect-on-failure.
+   Deepgram's own accuracy and real-world latency are not something those tests
+   can measure; expect roughly 300–500 ms end of speech to request sent.
+2. **A faster CPU, or `STT_MODEL=tiny.en`.** In local mode the decode *is* the
+   latency. Everything else is already hidden behind it.
+3. **Lower `CONTEXT_TURNS`** to `2–3`. Fewer prompt tokens, slightly faster
    first token.
-6. **Keep `LLM_MODEL=gpt-4o-mini`.** `gpt-4o` roughly doubles time-to-first-token.
-7. **`ANSWER_MODE=SHORT`** makes the answer *complete* sooner. It does not
+4. **Keep `LLM_MODEL=gpt-4o-mini`.** `gpt-4o` roughly doubles time-to-first-token.
+5. **`ANSWER_MODE=SHORT`** makes the answer *complete* sooner. It does not
    change time-to-first-token.
 
 ### Where the time actually goes
@@ -629,7 +661,7 @@ real_time_ai_assistant/
 ├── ui/
 │   ├── main_window.py      the window
 │   └── widgets.py          status pill, level meter, styles
-├── tests/                  81 tests, no network or audio required
+├── tests/                  95 tests, no network or audio required
 └── logs/app.log
 ```
 

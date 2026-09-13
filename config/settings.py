@@ -71,6 +71,12 @@ class Settings:
     stt_language: str = "en"
     deepgram_api_key: str = ""
     deepgram_model: str = "nova-3"
+    # Endpoint override. Exists so the streaming path can be tested against a
+    # local mock server, and so a self-hosted Deepgram can be pointed at.
+    deepgram_url: str = "wss://api.deepgram.com/v1/listen"
+    # Deepgram's own end-of-speech detection, milliseconds. Its equivalent of
+    # END_OF_UTTERANCE_SILENCE, running server-side on a real streaming model.
+    deepgram_endpointing: int = 300
     partial_interval: float = 0.7         # seconds between partial re-decodes
     # Start decoding the finished-looking utterance this far into a pause,
     # rather than waiting out end_of_utterance_silence first. The decode then
@@ -127,6 +133,8 @@ class Settings:
             stt_language=_env("STT_LANGUAGE", "en"),
             deepgram_api_key=_env("DEEPGRAM_API_KEY"),
             deepgram_model=_env("DEEPGRAM_MODEL", "nova-3"),
+            deepgram_url=_env("DEEPGRAM_URL", "wss://api.deepgram.com/v1/listen"),
+            deepgram_endpointing=_env_int("DEEPGRAM_ENDPOINTING", 300),
             partial_interval=_env_float("PARTIAL_INTERVAL", 0.7),
             pause_decode_after=_env_float("PAUSE_DECODE_AFTER", 0.20),
             warmup_model=_env_bool("WARMUP_MODEL", True),
