@@ -180,6 +180,10 @@ def test_connects_and_sends_the_api_key(server):
     t.start()
     try:
         assert collector.ready.wait(10), "never connected: %s" % collector.errors
+        # The client reports "ready" as soon as the handshake completes, which
+        # can beat the server's handler recording the headers - so wait for the
+        # server side too rather than racing it.
+        assert server.connected.wait(5), "server never saw the connection"
         assert server.auth == "Token test-key-123"
     finally:
         t.stop()
@@ -194,6 +198,7 @@ def test_request_url_carries_the_streaming_options(server):
     t.start()
     try:
         assert collector.ready.wait(10)
+        assert server.connected.wait(5), "server never saw the connection"
         assert "model=nova-3" in server.path
         assert "interim_results=true" in server.path
         assert "sample_rate=16000" in server.path

@@ -72,7 +72,11 @@ class LLMClient:
 
     # ------------------------------------------------------------------
     def describe(self) -> str:
-        return "%s / %s" % (self.settings.llm_provider, self.settings.llm_model)
+        s = self.settings
+        if s.llm_base_url:
+            host = s.llm_base_url.split("//")[-1].split("/")[0]
+            return "%s @ %s" % (s.llm_model, host)
+        return "%s / %s" % (s.llm_provider, s.llm_model)
 
     def set_model(self, model: str) -> None:
         self.settings.llm_model = model
@@ -128,7 +132,12 @@ class LLMClient:
                         "The 'openai' package is not installed (%s). "
                         "Run: pip install openai" % exc
                     ) from exc
-                self._client = OpenAI(api_key=s.openai_api_key, timeout=s.llm_timeout)
+                kwargs = {"api_key": s.openai_api_key, "timeout": s.llm_timeout}
+                if s.llm_base_url:
+                    # Groq, Cerebras, Together, a local Ollama - anything that
+                    # speaks the OpenAI chat-completions protocol.
+                    kwargs["base_url"] = s.llm_base_url
+                self._client = OpenAI(**kwargs)
             self._client_provider = s.llm_provider
             return self._client
 

@@ -77,6 +77,7 @@ class MainWindow(QWidget):
         self._answer_buffer = ""      # text waiting to be painted
         self._answer_text = ""        # everything received for this answer
         self._streaming = False
+        self._provisional = False     # answering a question that is not finished
         self._devices = []
 
         self._build_ui()
@@ -445,9 +446,19 @@ class MainWindow(QWidget):
         self.partial_label.setText("heard: %s" % event.text)
 
     def _on_question(self, event: ev.QuestionDetected) -> None:
-        suffix = "  (early)" if event.speculative else ""
-        self.question_label.setText(event.text + suffix)
-        self.partial_label.setText("")
+        self._provisional = event.speculative
+        self.question_label.setText(event.text)
+        # An early answer is a guess about a question that is not finished yet.
+        # Say so, rather than letting it read as settled and then swapping it.
+        if event.speculative:
+            self.question_label.setStyleSheet(
+                "font-size: %dpx; font-weight: 600; color: %s;"
+                % (self.settings.font_size + 1, COLORS["amber"])
+            )
+            self.partial_label.setText("answering early - may update when they finish")
+        else:
+            self.apply_font_size(self.settings.font_size)
+            self.partial_label.setText("")
 
     def _on_answer_started(self, event: ev.AnswerStarted) -> None:
         self._answer_buffer = ""
@@ -463,7 +474,18 @@ class MainWindow(QWidget):
         self._flush_answer()
         self._streaming = False
         if event.cancelled:
+            # The speaker changed the question mid-answer. Clear the stale text
+            # immediately so it cannot be misread as the answer to what they
+            # actually asked - the replacement is already on its way.
+            self.answer_view.clear()
+            self._answer_text = ""
+            self._answer_buffer = ""
+            self.partial_label.setText("question changed - re-answering")
             return
+        if self._provisional:
+            self._provisional = False
+            self.apply_font_size(self.settings.font_size)
+            self.partial_label.setText("")
         if event.full_text.strip():
             # Only now do we pay for markdown layout - code blocks, bullets and
             # emphasis all appear at once when the answer settles.

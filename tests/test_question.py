@@ -130,6 +130,82 @@ def test_speculation_waits_for_a_stable_transcript(settings):
     assert not gate.consider_partial("What is overfitting in ML", stable_for=0.05).should_ask
 
 
+# ---------------------------------------------------------------------------
+# Eager answering: replying before the speaker has finished
+# ---------------------------------------------------------------------------
+
+def test_eager_is_off_unless_asked_for(settings):
+    gate = QuestionGate(settings)
+    assert not gate.consider_eager("What is overfitting in machine learning").should_ask
+
+
+def test_eager_fires_on_a_complete_mid_speech_question(settings):
+    settings.eager_answer = True
+    gate = QuestionGate(settings)
+    decision = gate.consider_eager("What is the difference between bagging and boosting")
+    assert decision.should_ask and decision.speculative
+
+
+def test_eager_refuses_a_trailing_fragment(settings):
+    """The whole risk of eager answering is committing mid-sentence, so a
+    fragment that trails off must never fire."""
+    settings.eager_answer = True
+    gate = QuestionGate(settings)
+    for fragment in ("What is the difference between bagging and",
+                     "Can you explain how random forests work and why",
+                     "How would you optimise this query if the"):
+        assert not gate.consider_eager(fragment).should_ask, fragment
+
+
+def test_eager_needs_more_words_than_the_pause_gate(settings):
+    settings.eager_answer = True
+    settings.eager_min_words = 6
+    gate = QuestionGate(settings)
+    assert not gate.consider_eager("What is overfitting").should_ask
+    assert gate.consider_eager("What is overfitting in a deep learning model").should_ask
+
+
+def test_eager_respects_the_confidence_bar(settings):
+    settings.eager_answer = True
+    settings.eager_confidence = 0.99
+    gate = QuestionGate(settings)
+    assert not gate.consider_eager("What is overfitting in machine learning").should_ask
+
+
+def test_eager_does_not_stack_on_an_in_flight_answer(settings):
+    settings.eager_answer = True
+    gate = QuestionGate(settings)
+    first = gate.consider_eager("What is overfitting in machine learning")
+    assert first.should_ask
+    gate.note_asked(first.question, speculative=True)
+    assert not gate.consider_eager("What is overfitting in machine learning models").should_ask
+
+
+def test_eager_answer_is_replaced_when_the_question_grows(settings):
+    """The speaker adds a second half - the early answer must be superseded."""
+    settings.eager_answer = True
+    gate = QuestionGate(settings)
+    early = gate.consider_eager("What is overfitting in machine learning")
+    assert early.should_ask
+    gate.note_asked(early.question, speculative=True)
+
+    final = gate.consider_final(
+        "What is overfitting in machine learning and how do you prevent it on edge hardware"
+    )
+    assert final.should_ask and final.supersedes
+
+
+def test_eager_answer_is_kept_when_the_question_ends_there(settings):
+    settings.eager_answer = True
+    gate = QuestionGate(settings)
+    early = gate.consider_eager("What is overfitting in machine learning")
+    assert early.should_ask
+    gate.note_asked(early.question, speculative=True)
+
+    # Same question, just punctuated by the final decode - no second call.
+    assert not gate.consider_final("What is overfitting in machine learning?").should_ask
+
+
 def test_speculation_can_be_disabled(settings):
     settings.speculative_start = False
     gate = QuestionGate(settings)

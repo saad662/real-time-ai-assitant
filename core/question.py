@@ -211,6 +211,16 @@ _TRAILING_INCOMPLETE = {
 }
 
 
+# Extra words that mean "more is coming" when the speaker is still talking.
+# These are deliberately NOT in _TRAILING_INCOMPLETE: once someone has actually
+# stopped, "and why?" or "compared to what?" is a complete question. It is only
+# mid-speech that a trailing interrogative signals an unfinished clause -
+# "...how random forests work and why |they beat a single tree".
+_EAGER_TRAILING_INCOMPLETE = _TRAILING_INCOMPLETE | _INTERROGATIVES | {
+    "not", "so", "such", "including", "especially", "using", "given", "than",
+}
+
+
 def _looks_unfinished(words: list) -> bool:
     """Heuristic for 'the speaker is mid-sentence'.
 
@@ -331,6 +341,50 @@ class QuestionGate:
         return GateDecision(True, question=text.strip(), reason=result.reason,
                             confidence=result.confidence,
                             supersedes=bool(self._in_flight))
+
+    def consider_eager(self, text: str, has_context: bool = False) -> GateDecision:
+        """Answer *while the speaker is still talking*.
+
+        This is the only way to have text on screen before they finish, and it
+        is an explicit gamble rather than a safe optimisation: we commit to a
+        question before knowing how it ends. "What is overfitting" is a
+        complete, answerable question, but so is the start of "What is
+        overfitting in a model that has to run on edge hardware?"
+
+        So the rules are deliberately tighter than the pause gate - a longer
+        minimum length, a higher confidence bar, and a hard requirement that
+        the fragment does not trail off mid-clause - and the caller must be
+        prepared to cancel and re-ask when the real ending arrives.
+        """
+        s = self.settings
+        if not getattr(s, "eager_answer", False):
+            return GateDecision(False, reason="eager answering disabled")
+        if self._in_flight:
+            return GateDecision(False, reason="already answering")
+
+        words = normalize(text).split()
+        if len(words) < s.eager_min_words:
+            return GateDecision(False, reason="too short to answer early")
+
+        result = classify(text, has_context=has_context)
+        if not result.is_question:
+            return GateDecision(False, reason="not a question (%s)" % result.reason)
+        if not result.complete:
+            return GateDecision(False, reason="still mid-clause")
+        if words[-1] in _EAGER_TRAILING_INCOMPLETE:
+            return GateDecision(
+                False, reason="trails off on %r, more is coming" % words[-1]
+            )
+        if result.confidence < s.eager_confidence:
+            return GateDecision(
+                False, reason="confidence %.2f below eager bar" % result.confidence
+            )
+        if self.is_duplicate(text):
+            return GateDecision(False, reason="duplicate")
+
+        return GateDecision(True, question=text.strip(), speculative=True,
+                            confidence=result.confidence,
+                            reason="eager: " + result.reason)
 
     def consider_partial(self, text: str, stable_for: float,
                          has_context: bool = False) -> GateDecision:

@@ -194,6 +194,8 @@ Everything else in `.env` has a working default. The settings worth knowing:
 | Setting | Default | What it does |
 |---|---|---|
 | `LLM_MODEL` | `gpt-4o-mini` | Fast and cheap. `gpt-4o` is smarter and slower. |
+| `LLM_BASE_URL` | *(empty)* | Point at Groq/Cerebras for 100–250 ms first token. |
+| `EAGER_ANSWER` | `false` | Answer while they are still talking. See below. |
 | `STT_MODEL` | `tiny.en` | Speech model. `base.en` is more accurate and now affordable. |
 | `PAUSE_DECODE_AFTER` | `0.20` | Start decoding this far into a pause. The main latency lever. |
 | `END_OF_UTTERANCE_SILENCE` | `0.70` | Silence before a question counts as finished. |
@@ -349,7 +351,7 @@ moves but no utterances are detected, lower `VAD_THRESHOLD_DB`.
 pytest -q
 ```
 
-95 tests covering duplicate suppression, question detection, conversation
+103 tests covering duplicate suppression, question detection, conversation
 context, configuration, latency measurement, VAD segmentation and pause
 decoding, resampling, error handling, and the Deepgram streaming client
 (against a mock server). They need no API key, no audio device and no network.
@@ -528,6 +530,55 @@ An attempt to fix the contention — spacing partials adaptively at twice the
 measured decode time — was **measured and reverted**: median 942 ms against
 847 ms for the fixed interval. It made things worse, so it is not in the code.
 
+### Getting answers before they stop talking
+
+Two settings change the shape of this, not just the size.
+
+**1. A provider built for speed (`LLM_BASE_URL`).** Groq and Cerebras serve the
+OpenAI protocol from custom inference hardware and typically start replying in
+100–250 ms rather than 400–700 ms. Nothing in the code changes — point the base
+URL at them and put their key in `OPENAI_API_KEY`:
+
+```
+LLM_BASE_URL=https://api.groq.com/openai/v1
+LLM_MODEL=llama-3.1-8b-instant
+OPENAI_API_KEY=gsk_...your groq key...
+```
+
+OpenAI's own fastest is `LLM_MODEL=gpt-4.1-nano` with no base URL.
+
+**2. Eager answering (`EAGER_ANSWER=true`).** Normally the app waits for the
+speaker to pause. With this on, the request goes out as soon as a *mid-speech*
+transcript already reads as a complete question — so the answer can be on
+screen before they have finished asking.
+
+This is a gamble, and the README would be lying if it called it a free win.
+"What is overfitting in machine learning" is a complete question; it is also
+the first half of "What is overfitting in machine learning, and how would you
+prevent it on edge hardware?". When that happens the first answer is discarded
+and a second request goes out. You see the answer clear and rewrite itself, and
+you pay for both.
+
+What keeps it honest rather than merely wrong:
+
+- The question is shown in amber with *"answering early — may update when they
+  finish"*, so a provisional answer never reads as a settled one.
+- A superseded answer is **cleared immediately**, not left on screen where it
+  could be misread as the answer to what they actually asked.
+- A fragment that trails off on a conjunction or a bare interrogative
+  (*"...and why"*, *"...if the"*) never fires. Mid-speech, those mean more is
+  coming — though note the same words *are* a complete question once someone
+  has actually stopped, which is why that rule applies only to eager answering.
+- One attempt per utterance, so a long rambling question cannot spray requests.
+
+Worth turning on when questions are short and self-contained. Leave it off if
+the speaker thinks out loud or habitually tacks on clauses.
+
+**Combined**, with Groq and eager answering on, a self-contained question can
+have its answer starting while the last few words are still being spoken. A
+question with a twist at the end will still land after they stop — there is no
+way around that, because the twist has not been said yet.
+
 ### Squeezing out the rest
 
 1. **`STT_PROVIDER=deepgram` — the one that actually moves the needle.** It
@@ -661,7 +712,7 @@ real_time_ai_assistant/
 ├── ui/
 │   ├── main_window.py      the window
 │   └── widgets.py          status pill, level meter, styles
-├── tests/                  95 tests, no network or audio required
+├── tests/                  103 tests, no network or audio required
 └── logs/app.log
 ```
 

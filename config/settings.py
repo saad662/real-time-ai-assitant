@@ -56,6 +56,11 @@ class Settings:
     # ---- LLM -------------------------------------------------------------
     llm_provider: str = "openai"          # openai | anthropic
     llm_model: str = "gpt-4o-mini"
+    # Any OpenAI-compatible endpoint. This is how you reach the genuinely fast
+    # inference providers (Groq, Cerebras) without new client code - they speak
+    # the same wire protocol, they just run on hardware built for low
+    # time-to-first-token. Empty means api.openai.com.
+    llm_base_url: str = ""
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     llm_timeout: float = 30.0
@@ -101,6 +106,17 @@ class Settings:
     context_turns: int = 5                # rolling exchanges sent to the LLM
     speculative_start: bool = True
     speculative_min_words: int = 5
+    # Answer *while the speaker is still talking*, as soon as a mid-speech
+    # transcript already reads as a complete question. This is the only way to
+    # have text on screen before they finish. It is a deliberate gamble: if
+    # they keep going and change the question, the answer is cancelled and
+    # replaced, which costs extra tokens and is visible to you.
+    eager_answer: bool = False
+    eager_min_words: int = 6
+    # 0.65, not 0.70: a mid-speech transcript rarely has a question mark yet,
+    # and without one even a textbook "What is X in Y" tops out at 0.67. A
+    # higher bar would mean eager answering almost never fires.
+    eager_confidence: float = 0.65
     duplicate_similarity: float = 0.90
     duplicate_window: float = 45.0        # seconds
 
@@ -123,6 +139,7 @@ class Settings:
         s = cls(
             llm_provider=_env("LLM_PROVIDER", "openai").lower(),
             llm_model=_env("LLM_MODEL", "gpt-4o-mini"),
+            llm_base_url=_env("LLM_BASE_URL"),
             openai_api_key=_env("OPENAI_API_KEY"),
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             llm_timeout=_env_float("LLM_TIMEOUT", 30.0),
@@ -149,6 +166,9 @@ class Settings:
             context_turns=_env_int("CONTEXT_TURNS", 5),
             speculative_start=_env_bool("SPECULATIVE_START", True),
             speculative_min_words=_env_int("SPECULATIVE_MIN_WORDS", 5),
+            eager_answer=_env_bool("EAGER_ANSWER", False),
+            eager_min_words=_env_int("EAGER_MIN_WORDS", 6),
+            eager_confidence=_env_float("EAGER_CONFIDENCE", 0.65),
             duplicate_similarity=_env_float("DUPLICATE_SIMILARITY", 0.90),
             duplicate_window=_env_float("DUPLICATE_WINDOW", 45.0),
             answer_mode=_env("ANSWER_MODE", "NORMAL").upper(),
@@ -216,6 +236,8 @@ class Settings:
             0.05, min(self.pause_decode_after, self.end_of_utterance_silence - 0.05)
         )
         self.duplicate_similarity = max(0.5, min(1.0, self.duplicate_similarity))
+        self.eager_confidence = max(0.5, min(1.0, self.eager_confidence))
+        self.eager_min_words = max(3, min(30, self.eager_min_words))
 
     def redacted(self) -> dict:
         """asdict() with secrets masked - safe to write to the log file."""

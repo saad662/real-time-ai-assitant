@@ -101,6 +101,7 @@ class Pipeline:
         self._prefinal = None            # (uid, speech_samples, text) - arrived
         self._prefinal_pending = None    # (uid, speech_samples) - still decoding
         self._awaiting_prefinal = None   # (uid, speech_samples, audio, deadline)
+        self._eager_fired = -1           # utterance we already answered early
 
         # In-flight answer.
         self._handle = None
@@ -244,6 +245,7 @@ class Pipeline:
             self._prefinal = None
             self._prefinal_pending = None
             self._awaiting_prefinal = None
+            self._eager_fired = -1
             self._partial_changed_at = time.monotonic()
             self._last_partial_request = time.monotonic()
             self._tracker = LatencyTracker("utterance-%d" % uid)
@@ -384,6 +386,7 @@ class Pipeline:
             self._prefinal = None
             self._prefinal_pending = None
             self._awaiting_prefinal = None
+            self._eager_fired = -1
 
     # ------------------------------------------------------------------
     # Transcription callbacks (run on the STT thread)
@@ -398,6 +401,37 @@ class Pipeline:
             if self._tracker is not None:
                 self._tracker.mark(lat.PARTIAL_TRANSCRIPT)
         self._emit(PartialTranscript(text, utterance_id))
+        self._maybe_answer_early(text, utterance_id)
+
+    def _maybe_answer_early(self, text: str, utterance_id: int) -> None:
+        """Answer from a mid-speech partial, before the speaker has stopped.
+
+        Off by default (EAGER_ANSWER). When on, this is what puts text on
+        screen while the question is still being asked - at the cost of
+        sometimes answering a question that turns out to have a second half.
+        Limited to one attempt per utterance so a long question cannot fire a
+        stream of requests.
+        """
+        if not self.settings.eager_answer:
+            return
+        with self._lock:
+            if utterance_id != self._utterance_id or self._eager_fired == utterance_id:
+                return
+            tracker = self._tracker
+
+        decision = self.gate.consider_eager(text, has_context=self.context.has_context())
+        if not decision.should_ask:
+            return
+
+        with self._lock:
+            if self._eager_fired == utterance_id:
+                return          # another thread won the race
+            self._eager_fired = utterance_id
+
+        log.info("Answering early (%s): %s", decision.reason, decision.question)
+        self._ask(decision.question, tracker=tracker, speculative=True,
+                  supersedes=False, confidence=decision.confidence,
+                  utterance_id=utterance_id)
 
     def _on_final(self, text: str, utterance_id: int) -> None:
         with self._lock:
