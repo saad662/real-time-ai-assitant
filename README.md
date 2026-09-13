@@ -67,7 +67,7 @@ System audio ─▶ VAD ─▶ streaming transcription ─▶ question detection
 │ - More or better-augmented data            │
 ├────────────────────────────────────────────┤
 │ Type a question and press Enter...         │
-│ Latency: STT 780 ms  LLM 640 ms  Total 1.4s│
+│ Latency: STT 0 ms  LLM 640 ms  Total 0.64 s│
 └────────────────────────────────────────────┘
 ```
 
@@ -194,7 +194,8 @@ Everything else in `.env` has a working default. The settings worth knowing:
 | Setting | Default | What it does |
 |---|---|---|
 | `LLM_MODEL` | `gpt-4o-mini` | Fast and cheap. `gpt-4o` is smarter and slower. |
-| `STT_MODEL` | `tiny.en` | Speech model. `base.en` is more accurate, ~0.9 s slower. |
+| `STT_MODEL` | `tiny.en` | Speech model. `base.en` is more accurate and now affordable. |
+| `PAUSE_DECODE_AFTER` | `0.20` | Start decoding this far into a pause. The main latency lever. |
 | `END_OF_UTTERANCE_SILENCE` | `0.70` | Silence before a question counts as finished. |
 | `ANSWER_MODE` | `NORMAL` | `SHORT`, `NORMAL` or `DETAILED`. |
 | `CONTEXT_TURNS` | `5` | How many past exchanges the model can see. |
@@ -434,53 +435,92 @@ All numbers below were **measured** on this machine, not estimated:
 - AMD Ryzen 7 PRO 4750U, 8 cores, no GPU used
 - 2.8 second spoken question, `int8` quantisation
 
-### Speech-to-text (the dominant cost in local mode)
+### The headline number
 
-| Model | Download | Load time | Decode (2.8 s utterance) |
+Speaker stops talking → LLM request on the wire, measured through the real
+pipeline (playback → loopback capture → VAD → Whisper → question gate), best of
+three runs each:
+
+| Configuration | Latency | Transcript |
+|---|---|---|
+| Naive (decode after the silence window) | 1319 ms | correct |
+| **+ pause decode** | **692 ms** | correct |
+| **+ pause decode + speculative start** | **609 ms** | correct |
+
+**2.2× faster, same transcript, still exactly one API call per question.**
+Add the model's own time-to-first-token (400–700 ms on `gpt-4o-mini`) for the
+moment text appears on screen: roughly **1.0–1.3 s** end to end.
+
+### Where the time went, and how it was removed
+
+**1. The silence window was dead time.** The VAD waits
+`END_OF_UTTERANCE_SILENCE` (700 ms) before declaring a question finished, and
+the old code then started decoding — 700 ms of waiting followed by 400 ms of
+work. But everything inside that window is *silence*, so a transcript decoded
+at the start of it is identical to one decoded at the end. The pipeline now
+starts decoding `PAUSE_DECODE_AFTER` (200 ms) into the pause, so the decode
+finishes before the window closes. Measured end-of-speech → transcript in hand:
+**410 ms → 0 ms**. Speech-to-text left the critical path entirely.
+
+The reuse is guarded by an exact test, not a guess: the VAD reports how many
+samples of actual speech it has seen, and the transcript is reused only if that
+number is unchanged at end-of-utterance. If the speaker resumed — even by one
+20 ms frame — the numbers differ and it re-decodes.
+
+**2. The first decode was paying a warm-up tax.** CTranslate2 allocates its
+workspace lazily, making the first decode ~850 ms against ~390 ms warm. The app
+now burns one throwaway decode on silence at startup (`WARMUP_MODEL=true`).
+
+**3. `cpu_threads` was set too low.** Measured on 16 logical cores, `tiny.en`,
+2.8 s utterance:
+
+| threads | 2 | 4 | 6 | **8** | 12 | 16 |
+|---|---|---|---|---|---|---|
+| decode | 564 ms | 422 ms | 380 ms | **370 ms** | 427 ms | 437 ms |
+
+Past the physical core count the SMT siblings contend and it gets *slower*. The
+app now picks `min(8, logical - 2)`.
+
+### Speech-to-text model choice
+
+Warm decode of a 2.8 s utterance:
+
+| Model | Download | Load | Warm decode |
 |---|---|---|---|
-| `tiny.en` *(default)* | ~75 MB | 1.7 s | **0.85 s** |
-| `base.en` | ~145 MB | 11 s | 1.7 s |
-| `small.en` | ~480 MB | 37 s | 4.5 s |
+| `tiny.en` *(default)* | ~75 MB | 1.7 s | **390 ms** |
+| `base.en` | ~145 MB | 11 s | 745 ms |
+| `small.en` | ~480 MB | 37 s | 4.4 s |
 
-Decode time scales roughly with utterance length, so a 6-second question costs
-about twice these numbers. **This is why `tiny.en` is the default**, and why
-local Whisper on a CPU cannot reach the sub-second target on its own.
+**Decode time barely grows with utterance length** — 2.8 s costs 390 ms and
+5.3 s costs 409 ms, because Whisper pads to a 30-second window either way. So a
+long question is no more expensive than a short one, and `base.en` is perfectly
+usable now that the decode is hidden inside the silence window.
 
-### End-to-end, local mode
+### Squeezing out the rest
 
-Measured end of speech → final transcript with `tiny.en`: **673 ms** for a
-2.25 s utterance. Adding a typical `gpt-4o-mini` first token of 400–700 ms:
+The dominant remaining cost is the 700 ms silence window itself — that is the
+price of not cutting people off mid-sentence.
 
-| Question length | Realistic total (speaker stops → first word on screen) |
-|---|---|
-| ~3 seconds | 1.1 – 1.6 s |
-| ~6 seconds | 1.8 – 2.6 s |
-| ~10 seconds | 2.5 – 3.5 s |
-
-### How to actually get under 1.5 s
-
-1. **`STT_PROVIDER=deepgram`.** A genuine streaming model returns interim
-   results in 150–300 ms and costs zero local CPU. This is the single biggest
-   improvement available, and it is why the brief's suggestion to consider an
-   API for transcription is the right call. Needs a key from
+1. **`STT_PROVIDER=deepgram`.** A genuine streaming model with ~300 ms
+   endpointing and zero local CPU. Its `speech_final` signal drives speculation
+   the same way the local pause decode does. Needs a key from
    <https://deepgram.com>:
    ```
    STT_PROVIDER=deepgram
    DEEPGRAM_API_KEY=...
    ```
-2. **Leave `SPECULATIVE_START=true`.** When a partial transcript already reads
-   as a finished question and has stopped changing, the LLM request fires
-   *before* the speaker has stopped. The transcription cost then happens while
-   they are still talking, and the first token can land within a few hundred
-   milliseconds of them finishing. If they keep talking and change the
-   question, the request is cancelled and reissued.
-3. **`ANSWER_MODE=SHORT`.** Fewer output tokens means the answer completes
-   sooner; it does not change time-to-first-token.
-4. **Lower `END_OF_UTTERANCE_SILENCE`** to `0.5`. Directly removes 200 ms, at
-   the cost of occasionally cutting people off mid-question.
-5. **Lower `CONTEXT_TURNS`** to `2–3`. Fewer prompt tokens means a slightly
-   faster first token.
+2. **Lower `END_OF_UTTERANCE_SILENCE`** to `0.5`. Directly removes 200 ms. This
+   is now the single biggest remaining lever, and the cost is occasionally
+   cutting someone off mid-question.
+3. **Lower `PAUSE_DECODE_AFTER`** to `0.12`. Starts the decode sooner so
+   speculation can fire earlier. Costs some wasted decodes on mid-sentence
+   pauses; correctness is unaffected.
+4. **Keep `SPECULATIVE_START=true`.** Worth ~80 ms on top.
+5. **Lower `CONTEXT_TURNS`** to `2–3`. Fewer prompt tokens, slightly faster
+   first token.
 6. **Keep `LLM_MODEL=gpt-4o-mini`.** `gpt-4o` roughly doubles time-to-first-token.
+7. **`ANSWER_MODE=SHORT`** makes the answer *complete* sooner. It does not
+   change time-to-first-token.
 
 ### Where the time actually goes
 
@@ -488,22 +528,27 @@ The window shows the real breakdown after every answer, and `logs/app.log`
 records the full timeline:
 
 ```
-Latency: STT: 780 ms   LLM first token: 640 ms   Total: 1.42 s |
-  audio_detected=0ms speech_started=0ms partial_transcript=1240ms
-  final_transcript=2890ms question_detected=2891ms llm_request_started=2893ms
-  llm_first_token=3533ms llm_completed=5120ms
+Latency: STT: 0 ms   LLM first token: 640 ms   Total: 0.64 s |
+  audio_detected=0ms speech_started=0ms partial_transcript=3050ms
+  final_transcript=3060ms question_detected=3061ms llm_request_started=3063ms
+  llm_first_token=3703ms llm_completed=5120ms
 ```
 
-If `STT` dominates, use a smaller model or Deepgram. If `LLM first token`
+`STT: 0 ms` is the pause decode working — the transcript was already in hand
+when the utterance closed. If `STT` dominates, use a smaller model or Deepgram.
+If `LLM first token`
 dominates, use a smaller model or reduce `CONTEXT_TURNS`.
 
 ### What is *not* claimed
 
-Sub-second total latency is not guaranteed and is not achievable in local mode
-on an ordinary laptop for anything but very short questions. The 0.7 s
-end-of-utterance wait alone is most of a second, and removing it means cutting
-people off. The honest target is **1–1.5 s with Deepgram + speculative start**,
-and **1.5–2.5 s with local Whisper**.
+Sub-second *total* latency — speaker stops to first word on screen — is not
+guaranteed. Getting the request sent in 609 ms is measured and repeatable, but
+the model's time-to-first-token is network- and load-dependent, so the honest
+end-to-end figure is **1.0–1.3 s typical** and worse on a bad connection.
+
+The 700 ms silence window is a deliberate floor, not an oversight: it is what
+stops the app answering half a sentence. You can lower it, and the README tells
+you how, but that is a trade rather than a free win.
 
 ---
 
@@ -542,8 +587,9 @@ Read this before using it on a call with other people.
   stream. There is no way to tell who asked what.
 - **Overlapping speech confuses the VAD.** Crosstalk tends to produce one long
   utterance.
-- **Local Whisper is the latency bottleneck** and cannot be fixed by tuning —
-  see the table above.
+- **The 700 ms silence window is now the floor** in local mode. Whisper's
+  decode was removed from the critical path, so what remains is mostly the
+  deliberate wait that stops the app answering half a sentence.
 - **Question detection is heuristic**, not a model. It handles the phrasings in
   `tests/test_question.py` well and will occasionally be wrong on unusual ones.
   It deliberately errs toward *not* firing, because a wrong answer on screen is
@@ -621,12 +667,22 @@ time. Partial requests coalesce — if a decode is still running when the next i
 due, the older request is dropped rather than queued, so the transcriber can
 never fall behind real time.
 
-**Speculative start.** The end-of-utterance wait is pure latency. If a partial
-transcript already parses as a *complete* question and has stopped changing for
-60% of the silence window, the request fires early. If the final transcript
-turns out to differ materially, the in-flight request is cancelled — checked on
-every token — and reissued. This is what makes sub-1.5 s possible; set
-`SPECULATIVE_START=false` to trade the latency back for fewer tokens.
+**Decode during the pause, not after it.** See the latency section — this is
+the change that took 1319 ms down to 692 ms. Reuse is gated on an exact
+sample-count match, so a speaker who resumes mid-sentence always gets a fresh
+decode.
+
+**Speculation fires from the pause transcript, never from a partial.** An
+earlier version triggered whenever a mid-speech partial stopped changing, on
+the theory that a settled transcript means a finished sentence. Measuring it
+against real audio disproved that: a partial also stops changing simply because
+no new decode has completed yet, and it fired on *"What is overfitting in
+machine"* while the speaker was still saying *"learning"* — answering the wrong
+question in roughly a third of runs. A pause transcript carries the signal a
+partial lacks: the VAD has confirmed silence, and the decode covers every
+speech frame. Before firing, the pipeline re-checks that not one new frame of
+speech arrived while the decode was running. After that change, every measured
+run produced the correct transcript in a single API call.
 
 **Dedup on prefixes, not just equality.** `"What is"` → `"What is overfitting"`
 → `"What is overfitting in machine learning"` must cost one API call, not

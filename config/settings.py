@@ -72,6 +72,12 @@ class Settings:
     deepgram_api_key: str = ""
     deepgram_model: str = "nova-3"
     partial_interval: float = 0.7         # seconds between partial re-decodes
+    # Start decoding the finished-looking utterance this far into a pause,
+    # rather than waiting out end_of_utterance_silence first. The decode then
+    # runs *during* the silence instead of after it, which takes the whole STT
+    # cost off the critical path. See README "Latency".
+    pause_decode_after: float = 0.20
+    warmup_model: bool = True             # first decode is ~2x slower otherwise
 
     # ---- Audio -----------------------------------------------------------
     audio_mode: str = "loopback"          # loopback | microphone
@@ -122,6 +128,8 @@ class Settings:
             deepgram_api_key=_env("DEEPGRAM_API_KEY"),
             deepgram_model=_env("DEEPGRAM_MODEL", "nova-3"),
             partial_interval=_env_float("PARTIAL_INTERVAL", 0.7),
+            pause_decode_after=_env_float("PAUSE_DECODE_AFTER", 0.20),
+            warmup_model=_env_bool("WARMUP_MODEL", True),
             audio_mode=_env("AUDIO_MODE", "loopback").lower(),
             audio_device=_env("AUDIO_DEVICE"),
             vad_threshold_db=_env_float("VAD_THRESHOLD_DB", -45.0),
@@ -194,6 +202,11 @@ class Settings:
         self.min_speech_duration = max(0.05, min(2.0, self.min_speech_duration))
         self.max_utterance_seconds = max(5.0, min(120.0, self.max_utterance_seconds))
         self.preroll_seconds = max(0.0, min(2.0, self.preroll_seconds))
+        # The pause decode must fire strictly before end-of-utterance, or it
+        # buys nothing.
+        self.pause_decode_after = max(
+            0.05, min(self.pause_decode_after, self.end_of_utterance_silence - 0.05)
+        )
         self.duplicate_similarity = max(0.5, min(1.0, self.duplicate_similarity))
 
     def redacted(self) -> dict:

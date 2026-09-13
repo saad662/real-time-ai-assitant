@@ -14,7 +14,13 @@ from core import latency as lat
 from core.events import EventBus, StatusEvent
 from core.latency import LatencyTracker
 from speech.transcriber import is_probable_hallucination
-from speech.vad import SpeechEnd, SpeechStart, VoiceActivityDetector, rms_dbfs
+from speech.vad import (
+    SpeechEnd,
+    SpeechPause,
+    SpeechStart,
+    VoiceActivityDetector,
+    rms_dbfs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +268,68 @@ def test_long_monologue_is_cut_at_the_limit(settings):
     events += vad.process(_tone(8.0))
     ends = [e for e in events if isinstance(e, SpeechEnd)]
     assert ends and ends[0].truncated
+
+
+# --- pause decode: the main latency optimisation ---------------------------
+
+def test_pause_fires_before_end_of_utterance(settings):
+    """The pause event must arrive early enough to be worth anything."""
+    vad = VoiceActivityDetector(settings)
+    events = []
+    for block in (_silence(0.4), _tone(1.0), _silence(1.2)):
+        events.extend(vad.process(block))
+
+    kinds = [type(e).__name__ for e in events]
+    pauses = [e for e in events if isinstance(e, SpeechPause)]
+    ends = [e for e in events if isinstance(e, SpeechEnd)]
+    assert len(pauses) == 1, kinds
+    assert len(ends) == 1
+    # The pause must come first, otherwise there is no window to decode in.
+    assert events.index(pauses[0]) < events.index(ends[0])
+
+
+def test_pause_and_end_agree_when_speech_does_not_resume(settings):
+    """Equal speech_samples is the signal to reuse the pause transcript."""
+    vad = VoiceActivityDetector(settings)
+    events = []
+    for block in (_silence(0.4), _tone(1.0), _silence(1.2)):
+        events.extend(vad.process(block))
+    pause = [e for e in events if isinstance(e, SpeechPause)][0]
+    end = [e for e in events if isinstance(e, SpeechEnd)][0]
+    assert pause.speech_samples == end.speech_samples
+
+
+def test_resumed_speech_invalidates_the_pause_transcript(settings):
+    """A mid-sentence pause must not be mistaken for the end of a question."""
+    vad = VoiceActivityDetector(settings)
+    events = []
+    for block in (_silence(0.4), _tone(0.8), _silence(0.35), _tone(0.8), _silence(1.2)):
+        events.extend(vad.process(block))
+    pauses = [e for e in events if isinstance(e, SpeechPause)]
+    end = [e for e in events if isinstance(e, SpeechEnd)][0]
+    assert len(pauses) == 2, "one pause per quiet stretch"
+    # The first pause is stale - more speech followed it.
+    assert pauses[0].speech_samples < end.speech_samples
+    # The last one is still valid.
+    assert pauses[-1].speech_samples == end.speech_samples
+
+
+def test_pause_audio_excludes_the_silence(settings):
+    vad = VoiceActivityDetector(settings)
+    events = []
+    for block in (_silence(0.4), _tone(1.0), _silence(1.2)):
+        events.extend(vad.process(block))
+    pause = [e for e in events if isinstance(e, SpeechPause)][0]
+    assert pause.audio.size == pause.speech_samples
+    assert pause.audio.size > 0
+
+
+def test_pause_decode_cannot_be_configured_after_end_of_utterance(settings):
+    """A pause decode at or after end-of-utterance would buy nothing."""
+    settings.pause_decode_after = 5.0
+    settings.end_of_utterance_silence = 0.7
+    settings.validate()
+    assert settings.pause_decode_after < settings.end_of_utterance_silence
 
 
 def test_flush_closes_an_open_utterance(settings):

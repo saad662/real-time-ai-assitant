@@ -48,6 +48,19 @@ _HALLUCINATIONS = {
 _PUNCT_RE = re.compile(r"[^\w\s']+")
 
 
+def _decode_threads() -> int:
+    """How many CPU threads to give the decoder.
+
+    Measured on a 16-logical-core Ryzen 7 PRO 4750U with tiny.en/int8 on a
+    2.8 s utterance: 2 threads 564 ms, 4 -> 422 ms, 6 -> 380 ms, 8 -> 370 ms,
+    12 -> 427 ms, 16 -> 437 ms. Past the physical core count the SMT siblings
+    fight each other and it gets slower, so cap at 8 and leave two logical
+    cores for audio capture and the UI.
+    """
+    logical = os.cpu_count() or 4
+    return max(1, min(8, logical - 2))
+
+
 def is_probable_hallucination(text: str) -> bool:
     """True when a transcript looks like Whisper filling in silence."""
     cleaned = text.strip().lower()
@@ -72,18 +85,22 @@ class TranscriptionError(RuntimeError):
 class BaseTranscriber:
     """Common callback plumbing.
 
-    on_partial(text, utterance_id)  - best guess so far, may change
-    on_final(text, utterance_id)    - the transcript we act on
-    on_error(message)               - recoverable; the app keeps running
-    on_ready(message)               - model loaded / socket connected
+    on_partial(text, utterance_id)   - best guess so far, may change
+    on_prefinal(text, utterance_id, speech_samples)
+                                     - final-quality transcript produced during
+                                       a pause, before end-of-utterance
+    on_final(text, utterance_id)     - the transcript we act on
+    on_error(message)                - recoverable; the app keeps running
+    on_ready(message)                - model loaded / socket connected
     """
 
     name = "base"
 
     def __init__(self, settings: Settings, on_partial=None, on_final=None,
-                 on_error=None, on_ready=None) -> None:
+                 on_error=None, on_ready=None, on_prefinal=None) -> None:
         self.settings = settings
         self.on_partial = on_partial or (lambda text, uid: None)
+        self.on_prefinal = on_prefinal or (lambda text, uid, samples: None)
         self.on_final = on_final or (lambda text, uid: None)
         self.on_error = on_error or (lambda message: None)
         self.on_ready = on_ready or (lambda message: None)
@@ -93,6 +110,8 @@ class BaseTranscriber:
     def begin_utterance(self, utterance_id: int) -> None: ...
     def feed(self, audio: np.ndarray, utterance_id: int) -> None: ...
     def transcribe_partial(self, audio: np.ndarray, utterance_id: int) -> None: ...
+    def transcribe_prefinal(self, audio: np.ndarray, utterance_id: int,
+                            speech_samples: int) -> None: ...
     def transcribe_final(self, audio: np.ndarray, utterance_id: int) -> None: ...
 
 
@@ -143,10 +162,19 @@ class LocalWhisperTranscriber(BaseTranscriber):
             self._pending_partial = (audio, utterance_id)  # replaces any older one
         self._wake.set()
 
+    def transcribe_prefinal(self, audio: np.ndarray, utterance_id: int,
+                            speech_samples: int) -> None:
+        """Decode during a pause. Same quality as a final, just earlier."""
+        if not self._running.is_set() or audio.size == 0:
+            return
+        self._final_queue.put(("prefinal", audio, utterance_id,
+                               speech_samples, time.perf_counter()))
+        self._wake.set()
+
     def transcribe_final(self, audio: np.ndarray, utterance_id: int) -> None:
         if not self._running.is_set():
             return
-        self._final_queue.put((audio, utterance_id, time.perf_counter()))
+        self._final_queue.put(("final", audio, utterance_id, 0, time.perf_counter()))
         self._wake.set()
 
     # -- worker ------------------------------------------------------------
@@ -161,8 +189,11 @@ class LocalWhisperTranscriber(BaseTranscriber):
                 pass
 
             if job is not None:
-                audio, uid, queued_at = job
-                self._run_final(audio, uid, queued_at)
+                kind, audio, uid, speech_samples, queued_at = job
+                if kind == "prefinal":
+                    self._run_prefinal(audio, uid, speech_samples, queued_at)
+                else:
+                    self._run_final(audio, uid, queued_at)
                 continue
 
             with self._partial_lock:
@@ -193,8 +224,7 @@ class LocalWhisperTranscriber(BaseTranscriber):
                 s.stt_model,
                 device="cpu",
                 compute_type=s.stt_compute,
-                # Leave a core free for audio capture and the UI.
-                cpu_threads=max(1, min(4, (os.cpu_count() or 4) - 1)),
+                cpu_threads=_decode_threads(),
             )
         except Exception as exc:
             self.on_error(
@@ -206,9 +236,23 @@ class LocalWhisperTranscriber(BaseTranscriber):
             self._running.clear()
             return False
 
+        # The first decode after loading is roughly twice as slow as a warm one
+        # (measured: 850 ms vs 390 ms) because CTranslate2 allocates its
+        # workspace lazily. Burning one decode on silence here means the user's
+        # first real question does not pay for it.
+        if s.warmup_model:
+            try:
+                warm_started = time.perf_counter()
+                self._decode(np.zeros(SAMPLE_RATE, dtype=np.float32), quick=False)
+                log.debug("Warm-up decode took %.0f ms",
+                          (time.perf_counter() - warm_started) * 1000)
+            except Exception:
+                log.debug("Warm-up decode failed (harmless)", exc_info=True)
+
         elapsed = time.perf_counter() - started
         self.model_ready.set()
-        log.info("Whisper model ready in %.1fs", elapsed)
+        log.info("Whisper model ready in %.1fs (%d decode threads)",
+                 elapsed, _decode_threads())
         self.on_ready("Speech model '%s' ready (%.1fs)" % (s.stt_model, elapsed))
         return True
 
@@ -249,6 +293,31 @@ class LocalWhisperTranscriber(BaseTranscriber):
                 )
         except Exception:
             log.exception("Partial transcription failed")
+
+    def _run_prefinal(self, audio: np.ndarray, uid: int, speech_samples: int,
+                      queued_at: float) -> None:
+        """Decode the utterance during the end-of-utterance wait.
+
+        If the speaker stays quiet this result becomes the final transcript
+        with no further work, so the whole decode disappears from the critical
+        path. If they resume, the pipeline discards it - it compares
+        `speech_samples` against the value SpeechEnd reports.
+        """
+        if uid != self._active_utterance:
+            return
+        try:
+            text = self._decode(audio, quick=False)
+            took = (time.perf_counter() - queued_at) * 1000.0
+            if not text or is_probable_hallucination(text):
+                self.on_prefinal("", uid, speech_samples)
+                return
+            log.info("prefinal[%d] %.0fms (%.1fs audio): %s",
+                     uid, took, audio.size / SAMPLE_RATE, text)
+            self.on_prefinal(text, uid, speech_samples)
+        except Exception:
+            # Deliberately silent: with no callback the pipeline has nothing to
+            # reuse and falls back to a normal decode at end-of-utterance.
+            log.exception("Pause transcription failed; falling back to final decode")
 
     def _run_final(self, audio: np.ndarray, uid: int, queued_at: float) -> None:
         try:
@@ -425,8 +494,19 @@ class DeepgramTranscriber(BaseTranscriber):
             self._last_interim = ""
         else:
             self._last_interim = text
-        combined = " ".join(self._buffer + ([self._last_interim] if self._last_interim else []))
-        self.on_partial(combined.strip(), uid)
+        combined = " ".join(
+            self._buffer + ([self._last_interim] if self._last_interim else [])
+        ).strip()
+        self.on_partial(combined, uid)
+
+        # Deepgram's own endpointing says the speaker has stopped. That is the
+        # same signal the local path gets from the VAD pause, so it drives
+        # speculation the same way. speech_samples is -1 because there is no
+        # local audio extent to compare against, which also means the pipeline
+        # will never reuse this as the final transcript - Finalize still does
+        # that, from the server's flushed result.
+        if message.get("speech_final") and combined:
+            self.on_prefinal(combined, uid, -1)
 
     async def _send(self, payload: bytes) -> None:
         ws = self._ws

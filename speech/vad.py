@@ -49,10 +49,24 @@ class SpeechChunk:
 
 
 @dataclass
+class SpeechPause:
+    """The speaker has gone quiet, but we have not yet called it the end.
+
+    Emitted once per pause, PAUSE_DECODE_AFTER seconds in. Everything after
+    this point is silence, so a transcript decoded now is identical to one
+    decoded at end-of-utterance - which lets the decode run *during* the
+    remaining wait instead of after it.
+    """
+    audio: np.ndarray          # the utterance with the pause trimmed off
+    speech_samples: int        # extent of actual speech, for staleness checks
+
+
+@dataclass
 class SpeechEnd:
     audio: np.ndarray          # the complete utterance
     duration: float
     truncated: bool = False    # True when MAX_UTTERANCE_SECONDS forced the cut
+    speech_samples: int = 0    # compare with SpeechPause to detect resumed speech
 
 
 @dataclass
@@ -66,9 +80,18 @@ class Level:
 class VadState:
     in_speech: bool = False
     noise_floor_db: float = -60.0
-    speech_run: float = 0.0     # seconds of consecutive speech frames
-    silence_run: float = 0.0    # seconds of consecutive silence frames
+    # Counted in frames, not seconds. Accumulating 0.02 in a float drifts, and
+    # the pause/end sample counts have to match *exactly* for the pause-decode
+    # reuse in core/pipeline.py to be safe.
+    speech_frames: int = 0
+    silence_frames: int = 0
     utterance: list = field(default_factory=list)
+    pause_emitted: bool = False  # one SpeechPause per pause, not per frame
+
+    @property
+    def silence_run(self) -> float:
+        """Seconds of trailing silence - for display and callers that want it."""
+        return self.silence_frames * FRAME_MS / 1000.0
 
 
 def rms_dbfs(frame: np.ndarray) -> float:
@@ -94,8 +117,30 @@ class VoiceActivityDetector:
         self._preroll = deque(maxlen=preroll_frames)
         self._frame_seconds = FRAME_MS / 1000.0
         self._level_counter = 0
+        # Thresholds converted to frame counts once, so the hot path only does
+        # integer comparisons.
+        self._min_speech_frames = self._frames_for(settings.min_speech_duration)
+        self._pause_frames = self._frames_for(settings.pause_decode_after)
+        self._end_frames = self._frames_for(settings.end_of_utterance_silence)
+        self._keep_tail_samples = int(_KEEP_TAIL_SECONDS * SAMPLE_RATE)
+
+    @staticmethod
+    def _frames_for(seconds: float) -> int:
+        return max(1, int(round(seconds * 1000.0 / FRAME_MS)))
 
     # ------------------------------------------------------------------
+    def current_speech_samples(self) -> int:
+        """Extent of speech in the open utterance right now.
+
+        Callers compare this against the value carried by an earlier
+        SpeechPause to check that nothing new was said in the meantime.
+        """
+        return self._speech_samples() if self.state.in_speech else -1
+
+    def is_quiet(self) -> bool:
+        """True when the speaker is inside a pause we have not yet closed."""
+        return self.state.in_speech and self.state.silence_frames > 0
+
     def reset(self) -> None:
         self.state = VadState(noise_floor_db=self.state.noise_floor_db)
         self._pending = np.zeros(0, dtype=np.float32)
@@ -153,16 +198,16 @@ class VoiceActivityDetector:
         if not st.in_speech:
             self._preroll.append(frame.copy())
             if is_speech:
-                st.speech_run += self._frame_seconds
-                if st.speech_run >= s.min_speech_duration:
+                st.speech_frames += 1
+                if st.speech_frames >= self._min_speech_frames:
                     opening = np.concatenate(list(self._preroll))
                     self._preroll.clear()
                     st.in_speech = True
-                    st.silence_run = 0.0
+                    st.silence_frames = 0
                     st.utterance = [opening]
                     events.append(SpeechStart(opening))
             else:
-                st.speech_run = 0.0
+                st.speech_frames = 0
             return events
 
         # --- inside an utterance -----------------------------------------
@@ -170,12 +215,21 @@ class VoiceActivityDetector:
         events.append(SpeechChunk(frame))
 
         if is_speech:
-            st.silence_run = 0.0
+            st.silence_frames = 0
+            st.pause_emitted = False   # the pause turned out to be mid-sentence
         else:
-            st.silence_run += self._frame_seconds
+            st.silence_frames += 1
+            if not st.pause_emitted and st.silence_frames >= self._pause_frames:
+                st.pause_emitted = True
+                speech_samples = self._speech_samples()
+                if speech_samples > 0:
+                    events.append(SpeechPause(
+                        audio=np.concatenate(st.utterance)[:speech_samples],
+                        speech_samples=speech_samples,
+                    ))
 
         duration = self._utterance_seconds()
-        if st.silence_run >= s.end_of_utterance_silence:
+        if st.silence_frames >= self._end_frames:
             end = self._close_utterance(truncated=False)
             if end:
                 events.append(end)
@@ -190,26 +244,40 @@ class VoiceActivityDetector:
     def _utterance_seconds(self) -> float:
         return sum(chunk.size for chunk in self.state.utterance) / float(SAMPLE_RATE)
 
+    def _speech_samples(self) -> int:
+        """Samples up to the last frame that contained speech.
+
+        Two events reporting the same value means no new speech happened
+        between them, which is exactly the condition for reusing a transcript
+        decoded at the pause as the final one.
+        """
+        total = sum(chunk.size for chunk in self.state.utterance)
+        return max(0, total - self.state.silence_frames * FRAME_SAMPLES)
+
     def _close_utterance(self, truncated: bool):
         st = self.state
         if not st.utterance:
             st.in_speech = False
+            st.pause_emitted = False
             return None
 
+        speech_samples = self._speech_samples()
         audio = np.concatenate(st.utterance)
         if not truncated:
             # Trim the silence we waited through, keeping a short tail.
-            trim = int((st.silence_run - _KEEP_TAIL_SECONDS) * SAMPLE_RATE)
+            trim = st.silence_frames * FRAME_SAMPLES - self._keep_tail_samples
             if trim > 0 and trim < audio.size:
                 audio = audio[:audio.size - trim]
 
         duration = audio.size / float(SAMPLE_RATE)
         st.in_speech = False
-        st.speech_run = 0.0
-        st.silence_run = 0.0
+        st.speech_frames = 0
+        st.silence_frames = 0
+        st.pause_emitted = False
         st.utterance = []
         self._preroll.clear()
 
         if duration < self.settings.min_speech_duration:
             return None
-        return SpeechEnd(audio=audio, duration=duration, truncated=truncated)
+        return SpeechEnd(audio=audio, duration=duration, truncated=truncated,
+                         speech_samples=speech_samples)

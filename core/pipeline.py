@@ -31,7 +31,14 @@ from audio.capture import AudioCapture
 from audio.devices import AudioDevice, AudioDeviceError, resolve_device
 from config.settings import SAMPLE_RATE, Settings
 from speech.transcriber import create_transcriber
-from speech.vad import Level, SpeechChunk, SpeechEnd, SpeechStart, VoiceActivityDetector
+from speech.vad import (
+    Level,
+    SpeechChunk,
+    SpeechEnd,
+    SpeechPause,
+    SpeechStart,
+    VoiceActivityDetector,
+)
 
 from . import latency as lat
 from .events import (
@@ -60,6 +67,10 @@ STATUS_ANSWERING = "answering"
 STATUS_READY = "ready"
 STATUS_ERROR = "error"
 
+# How long end-of-utterance will defer to an in-flight pause decode before
+# giving up and decoding itself.
+_PREFINAL_TIMEOUT = 6.0
+
 
 class Pipeline:
     def __init__(self, settings: Settings, bus: EventBus = None) -> None:
@@ -85,6 +96,11 @@ class Pipeline:
         self._partial_text = ""
         self._partial_changed_at = 0.0
         self._tracker = None
+        # Transcript decoded during a pause; reusable as the final one if the
+        # speaker never resumed. See _on_prefinal / _on_speech_end.
+        self._prefinal = None            # (uid, speech_samples, text) - arrived
+        self._prefinal_pending = None    # (uid, speech_samples) - still decoding
+        self._awaiting_prefinal = None   # (uid, speech_samples, audio, deadline)
 
         # In-flight answer.
         self._handle = None
@@ -115,6 +131,7 @@ class Pipeline:
         self._transcriber = create_transcriber(
             self.settings,
             on_partial=self._on_partial,
+            on_prefinal=self._on_prefinal,
             on_final=self._on_final,
             on_error=lambda message: self._fail(message),
             on_ready=lambda message: self._emit(StatusEvent(STATUS_LISTENING, message)),
@@ -198,7 +215,7 @@ class Pipeline:
                 if block is not None:
                     for event in self._vad.process(block):
                         self._handle_vad_event(event)
-                self._maybe_speculate()
+                self._check_prefinal_timeout()
             except Exception:
                 log.exception("Pipeline worker error")
                 time.sleep(0.2)
@@ -211,6 +228,8 @@ class Pipeline:
             self._on_speech_start(event)
         elif isinstance(event, SpeechChunk):
             self._on_speech_chunk(event)
+        elif isinstance(event, SpeechPause):
+            self._on_speech_pause(event)
         elif isinstance(event, SpeechEnd):
             self._on_speech_end(event)
 
@@ -222,6 +241,9 @@ class Pipeline:
             self._utterance_audio = [event.audio]
             self._utterance_samples = event.audio.size
             self._partial_text = ""
+            self._prefinal = None
+            self._prefinal_pending = None
+            self._awaiting_prefinal = None
             self._partial_changed_at = time.monotonic()
             self._last_partial_request = time.monotonic()
             self._tracker = LatencyTracker("utterance-%d" % uid)
@@ -238,8 +260,13 @@ class Pipeline:
             uid = self._utterance_id
             self._utterance_audio.append(event.audio)
             self._utterance_samples += event.audio.size
+            # No periodic partial while the speaker is pausing: the pause decode
+            # covers exactly the same audio at final quality, and a competing
+            # partial would only delay it.
+            in_pause = self._vad.state.silence_frames > 0
             due = (
-                time.monotonic() - self._last_partial_request
+                not in_pause
+                and time.monotonic() - self._last_partial_request
                 >= self.settings.partial_interval
             )
             if due:
@@ -255,15 +282,98 @@ class Pipeline:
         if audio is not None and audio.size >= SAMPLE_RATE * 0.6:
             self._transcriber.transcribe_partial(audio, uid)
 
+    def _on_speech_pause(self, event: SpeechPause) -> None:
+        """The speaker went quiet. Start decoding now instead of waiting.
+
+        Everything from here to end-of-utterance is silence, so this decode
+        produces the same text the final one would - it just runs during the
+        END_OF_UTTERANCE_SILENCE window rather than after it. On this machine
+        that takes ~390 ms of Whisper off the critical path entirely.
+        """
+        with self._lock:
+            uid = self._utterance_id
+            self._prefinal = None
+            self._prefinal_pending = (uid, event.speech_samples)
+        self._transcriber.transcribe_prefinal(event.audio, uid, event.speech_samples)
+
+    def _on_prefinal(self, text: str, utterance_id: int, speech_samples: int) -> None:
+        """A pause decode came back. Three jobs: show it, maybe answer now, and
+        satisfy end-of-utterance if it is already waiting on us."""
+        with self._lock:
+            if utterance_id != self._utterance_id:
+                return
+            self._prefinal = (utterance_id, speech_samples, text)
+            self._prefinal_pending = None
+            if text and text.strip() != self._partial_text.strip():
+                self._partial_text = text
+                self._partial_changed_at = time.monotonic()
+            if self._tracker is not None:
+                self._tracker.mark(lat.PARTIAL_TRANSCRIPT)
+            waiting = self._awaiting_prefinal
+            if waiting is not None and waiting[0] == utterance_id \
+                    and waiting[1] == speech_samples:
+                self._awaiting_prefinal = None
+            else:
+                waiting = None
+
+        if waiting is not None:
+            # End-of-utterance already happened and deferred to this decode.
+            log.info("Pause transcript satisfied end-of-utterance for %d", utterance_id)
+            self._on_final(text, utterance_id)
+            return
+
+        if text:
+            self._emit(PartialTranscript(text, utterance_id))
+            self._maybe_speculate(text, utterance_id, speech_samples)
+
     def _on_speech_end(self, event: SpeechEnd) -> None:
         with self._lock:
             uid = self._utterance_id
             self._utterance_audio = []
             self._utterance_samples = 0
+            prefinal = self._prefinal
+            pending = self._prefinal_pending
+            self._prefinal = None
         log.debug("Utterance %d ended (%.1fs%s)", uid, event.duration,
                   ", truncated" if event.truncated else "")
+
+        usable = (not event.truncated) and uid == self._utterance_id
+
+        # Case 1: the pause decode already finished and covers the same speech.
+        # Matching sample counts is an exact test, not a heuristic - the VAD
+        # reports the same number only if the speaker never resumed.
+        if (usable and prefinal is not None
+                and prefinal[0] == uid
+                and prefinal[1] == event.speech_samples):
+            log.info("Reusing pause transcript for utterance %d (no re-decode)", uid)
+            self._on_final(prefinal[2], uid)
+            return
+
+        # Case 2: it is still decoding the very same audio. Waiting for it
+        # beats starting a second identical decode, which on a slow machine
+        # would double the work at exactly the wrong moment.
+        if (usable and pending is not None
+                and pending[0] == uid
+                and pending[1] == event.speech_samples):
+            log.debug("Waiting on in-flight pause decode for utterance %d", uid)
+            with self._lock:
+                self._awaiting_prefinal = (uid, event.speech_samples, event.audio,
+                                           time.monotonic() + _PREFINAL_TIMEOUT)
+            self._emit(StatusEvent(STATUS_THINKING, "Transcribing..."))
+            return
+
         self._emit(StatusEvent(STATUS_THINKING, "Transcribing..."))
         self._transcriber.transcribe_final(event.audio, uid)
+
+    def _check_prefinal_timeout(self) -> None:
+        """Safety net: never hang forever on a pause decode that never returns."""
+        with self._lock:
+            waiting = self._awaiting_prefinal
+            if waiting is None or time.monotonic() < waiting[3]:
+                return
+            self._awaiting_prefinal = None
+        log.warning("Pause decode did not return in time; decoding normally")
+        self._transcriber.transcribe_final(waiting[2], waiting[0])
 
     def _reset_utterance(self) -> None:
         with self._lock:
@@ -271,6 +381,9 @@ class Pipeline:
             self._utterance_samples = 0
             self._partial_text = ""
             self._tracker = None
+            self._prefinal = None
+            self._prefinal_pending = None
+            self._awaiting_prefinal = None
 
     # ------------------------------------------------------------------
     # Transcription callbacks (run on the STT thread)
@@ -324,21 +437,50 @@ class Pipeline:
     # ------------------------------------------------------------------
     # Speculative start
     # ------------------------------------------------------------------
-    def _maybe_speculate(self) -> None:
-        """Called every worker tick. Fires the LLM before end-of-utterance when
-        the partial transcript already reads as a finished question."""
+    def _maybe_speculate(self, text: str, uid: int, speech_samples: int) -> None:
+        """Fire the LLM before end-of-utterance, from a pause transcript only.
+
+        This is deliberately *not* driven by mid-speech partials. An earlier
+        version triggered whenever the partial transcript stopped changing, on
+        the theory that a settled transcript means a finished sentence. It does
+        not: a partial also stops changing simply because no new decode has
+        completed yet. Measured against real audio, that fired on
+        "What is overfitting in machine" while the speaker was still saying
+        "learning", and answered the wrong question about a third of the time.
+
+        A pause transcript carries the signal the partial lacked - the VAD has
+        confirmed the speaker actually went quiet, and the decode covers every
+        speech frame up to that point. So the text is already settled by
+        construction, and the gate is told so.
+
+        One more check before firing: the decode itself took a few hundred
+        milliseconds, so by now the speaker has been silent for roughly
+        PAUSE_DECODE_AFTER plus the decode time - most of the way to
+        END_OF_UTTERANCE_SILENCE. If they had merely drawn breath mid-sentence
+        they would almost certainly have resumed by now, and if they did, the
+        speech extent no longer matches and we let end-of-utterance handle it.
+        That is what makes firing early nearly as safe as waiting.
+        """
         with self._lock:
-            text = self._partial_text
-            changed_at = self._partial_changed_at
-            uid = self._utterance_id
             tracker = self._tracker
-            in_speech = self._vad.state.in_speech
-        if not text or not in_speech:
+            current = self._utterance_id
+        if not text or uid != current:
+            return
+        if speech_samples >= 0:
+            # Local path: require that not one new frame of speech arrived.
+            if not self._vad.is_quiet():
+                log.debug("Speculation skipped: speaker resumed during the decode")
+                return
+            if self._vad.current_speech_samples() != speech_samples:
+                log.debug("Speculation skipped: more speech arrived during the decode")
+                return
+        elif not self._vad.state.in_speech:
+            # Deepgram path: no local extent to compare, so just require that
+            # the utterance is still open.
             return
 
-        stable_for = time.monotonic() - changed_at
         decision = self.gate.consider_partial(
-            text, stable_for, has_context=self.context.has_context()
+            text, stable_for=float("inf"), has_context=self.context.has_context()
         )
         if not decision.should_ask:
             return
