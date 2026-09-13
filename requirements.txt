@@ -1,0 +1,30 @@
+# --- core -------------------------------------------------------------------
+python-dotenv>=1.0.1
+numpy>=1.26,<3
+
+# --- audio capture ----------------------------------------------------------
+# 0.5.0 is the first release with WASAPI loopback support - do not downgrade.
+sounddevice>=0.5.1
+# Fallback loopback backend, used automatically if PortAudio's fails.
+soundcard>=0.4.3
+
+# --- speech to text (local, default) ----------------------------------------
+faster-whisper>=1.0.3
+
+# --- LLM --------------------------------------------------------------------
+openai>=1.51.0
+
+# --- desktop UI -------------------------------------------------------------
+PySide6>=6.7.0
+
+# --- global hotkeys ---------------------------------------------------------
+pynput>=1.7.7
+
+# --- optional -----------------------------------------------------------------
+# Needed only for STT_PROVIDER=deepgram
+websockets>=12.0
+# Needed only for LLM_PROVIDER=anthropic
+# anthropic>=0.40.0
+
+# --- tests ------------------------------------------------------------------
+pytest>=8.0
