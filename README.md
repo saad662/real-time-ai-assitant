@@ -351,7 +351,7 @@ moves but no utterances are detected, lower `VAD_THRESHOLD_DB`.
 pytest -q
 ```
 
-103 tests covering duplicate suppression, question detection, conversation
+105 tests covering duplicate suppression, question detection, conversation
 context, configuration, latency measurement, VAD segmentation and pause
 decoding, resampling, error handling, and the Deepgram streaming client
 (against a mock server). They need no API key, no audio device and no network.
@@ -446,9 +446,14 @@ three runs each:
 
 | Configuration | Latency | Transcript |
 |---|---|---|
-| Naive (decode after the silence window) | 1319 ms | correct |
-| **+ pause decode** | **692 ms** | correct |
-| **+ pause decode + speculative start** | **609 ms** | correct |
+| Local Whisper, naive (decode after the silence window) | 1319 ms | correct |
+| Local Whisper + pause decode | 692 ms | correct |
+| Local Whisper + pause decode + speculative start | 609 ms | correct |
+| Deepgram, waiting for its endpointing | 664 ms | correct |
+| Deepgram, `DEEPGRAM_ENDPOINTING=100` | 452 ms | correct |
+| **Deepgram + `EAGER_ANSWER=true`** | **170–192 ms** | correct |
+
+Those Deepgram rows are against the live API, not a mock.
 
 **2.2× faster, same transcript, still exactly one API call per question.**
 Add the model's own time-to-first-token (400–700 ms on `gpt-4o-mini`) for the
@@ -574,10 +579,36 @@ What keeps it honest rather than merely wrong:
 Worth turning on when questions are short and self-contained. Leave it off if
 the speaker thinks out loud or habitually tacks on clauses.
 
+**Measured against the live Deepgram API**, eager answering is the single
+biggest win available — because Deepgram's interim transcripts are fast
+(~150 ms) while its *endpointing* is not (~630 ms). Acting on the interim skips
+that wait entirely:
+
+| Deepgram configuration | Speaker stops → request sent |
+|---|---|
+| Wait for `speech_final` (default) | 664 ms |
+| `DEEPGRAM_ENDPOINTING=100` | 452 ms |
+| **`EAGER_ANSWER=true`** | **170–192 ms** |
+
+And the failure case, measured rather than assumed. Playing *"What is
+overfitting in machine learning, and how would you prevent it on edge
+hardware?"* with eager on:
+
+```
+2 requests, 1 cancelled, 1 early
+  - "What is overfitting in machine learning?"              <- early guess
+  - "What is overfitting in machine learning and how        <- replaces it
+     would you prevent it on edge hardware"
+```
+
+You get an answer to the first half almost immediately, and it is replaced by
+the full answer when they finish. That is the trade, in full: faster start,
+one extra request, and a visible swap.
+
 **Combined**, with Groq and eager answering on, a self-contained question can
 have its answer starting while the last few words are still being spoken. A
-question with a twist at the end will still land after they stop — there is no
-way around that, because the twist has not been said yet.
+question with a twist at the end will still be *finished* after they stop —
+there is no way around that, because the twist has not been said yet.
 
 ### Squeezing out the rest
 
@@ -712,7 +743,7 @@ real_time_ai_assistant/
 ├── ui/
 │   ├── main_window.py      the window
 │   └── widgets.py          status pill, level meter, styles
-├── tests/                  103 tests, no network or audio required
+├── tests/                  105 tests, no network or audio required
 └── logs/app.log
 ```
 

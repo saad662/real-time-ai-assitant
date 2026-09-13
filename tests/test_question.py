@@ -195,6 +195,38 @@ def test_eager_answer_is_replaced_when_the_question_grows(settings):
     assert final.should_ask and final.supersedes
 
 
+def test_eager_answer_is_replaced_even_after_it_finished_streaming(settings):
+    """Regression: the second half of the question must still get asked.
+
+    A short eager answer can finish streaming before the speaker reaches the
+    end of their sentence. At that point the in-flight markers are cleared, so
+    the only thing standing between the real question and the model is the
+    duplicate check - and prefix-dedup used to swallow it, meaning
+    "...and how would you prevent it on edge hardware?" was never answered.
+    """
+    settings.eager_answer = True
+    gate = QuestionGate(settings)
+    early = gate.consider_eager("What is overfitting in machine learning")
+    assert early.should_ask
+    gate.note_asked(early.question, speculative=True)
+    gate.note_answered()          # the early answer finished streaming
+
+    decision = gate.consider_final(
+        "What is overfitting in machine learning and how would you prevent it on edge hardware"
+    )
+    assert decision.should_ask, "the complete question was silently dropped"
+    assert "edge hardware" in decision.question
+
+
+def test_prefix_dedup_still_applies_to_normal_questions(settings):
+    """The eager exemption must not reopen the duplicate hole it was carved
+    out of - a non-speculative prefix is still a duplicate."""
+    gate = QuestionGate(settings)
+    gate.note_asked("What is overfitting", speculative=False)
+    gate.note_answered()
+    assert not gate.consider_final("What is overfitting in machine learning").should_ask
+
+
 def test_eager_answer_is_kept_when_the_question_ends_there(settings):
     settings.eager_answer = True
     gate = QuestionGate(settings)

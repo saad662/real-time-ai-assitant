@@ -273,7 +273,11 @@ class QuestionGate:
         self._speculative = ""
 
     def note_asked(self, text: str, speculative: bool = False) -> None:
-        self._recent.append((normalize(text), time.monotonic()))
+        # The speculative flag is kept per entry, not just for the in-flight
+        # question: an early answer may well have finished streaming before the
+        # speaker reaches the end of their sentence, and is_duplicate still has
+        # to know that entry was a guess at an unfinished question.
+        self._recent.append((normalize(text), time.monotonic(), speculative))
         self._in_flight = text
         self._speculative = text if speculative else ""
         self._prune()
@@ -284,7 +288,7 @@ class QuestionGate:
 
     def _prune(self) -> None:
         cutoff = time.monotonic() - self.settings.duplicate_window
-        self._recent = [(t, ts) for t, ts in self._recent if ts >= cutoff][-20:]
+        self._recent = [e for e in self._recent if e[1] >= cutoff][-20:]
 
     # -- the decision ------------------------------------------------------
     def is_duplicate(self, text: str) -> bool:
@@ -294,19 +298,25 @@ class QuestionGate:
         if not candidate:
             return True
         threshold = self.settings.duplicate_similarity
-        for previous, _ts in self._recent:
+        for previous, _ts, was_speculative in self._recent:
             if candidate == previous:
                 return True
-            # Growing partials in either direction:
-            #   "what is over"  vs  "what is overfitting"            (shorter)
-            #   "what is overfitting" vs "what is overfitting in ml" (longer)
-            # The length guard keeps a genuinely elaborated question askable.
+            # A shorter re-run of something already asked adds nothing:
+            #   "what is over" after "what is overfitting"
             if candidate in previous:
                 return True
-            # The brief's case: "What is overfitting" was answered, then the
-            # transcriber finalises "What is overfitting in machine learning".
-            # Same question, more words - not a second call.
-            if previous and candidate.startswith(previous):
+            # A longer version of something already asked is normally the same
+            # question with more of the transcript filled in - "What is
+            # overfitting" then "What is overfitting in machine learning" must
+            # cost one call, not two.
+            #
+            # Unless the earlier one was asked *speculatively*. An eager answer
+            # is a deliberate guess at a sentence that had not finished, so it
+            # is expected to be a prefix of the real question. Treating that as
+            # a duplicate silently swallows the half the speaker actually cared
+            # about: "...and how would you prevent it on edge hardware?" never
+            # got asked at all.
+            if previous and candidate.startswith(previous) and not was_speculative:
                 return True
             if similarity(candidate, previous) >= threshold:
                 return True
