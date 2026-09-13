@@ -353,6 +353,8 @@ class DeepgramTranscriber(BaseTranscriber):
     """
 
     name = "deepgram"
+    # Deepgram closes an idle socket after roughly ten seconds.
+    _KEEPALIVE_SECONDS = 5.0
     _QUERY = (
         "?model={model}&encoding=linear16&sample_rate={rate}&channels=1"
         "&interim_results=true&punctuate=true&smart_format=true&endpointing={endpointing}"
@@ -368,6 +370,7 @@ class DeepgramTranscriber(BaseTranscriber):
         self._buffer = []           # confirmed pieces of the current utterance
         self._last_interim = ""
         self._connected = threading.Event()
+        self._last_send = 0.0       # for the keep-alive; see _keepalive()
 
     def start(self) -> None:
         if self._running.is_set():
@@ -473,7 +476,7 @@ class DeepgramTranscriber(BaseTranscriber):
         url = s.deepgram_url.rstrip("/") + self._QUERY.format(
             model=s.deepgram_model, rate=SAMPLE_RATE,
             endpointing=s.deepgram_endpointing,
-        )
+        ) + self._keyterm_query()
         headers = {"Authorization": "Token %s" % s.deepgram_api_key}
         log.info("Connecting to %s", s.deepgram_url)
 
@@ -487,16 +490,21 @@ class DeepgramTranscriber(BaseTranscriber):
 
                 async with connect as ws:
                     self._ws = ws
+                    self._last_send = time.monotonic()
                     self._connected.set()
                     self.on_ready("Deepgram connected (%s)" % self.settings.deepgram_model)
                     log.info("Deepgram WebSocket connected")
-                    async for raw in ws:
-                        if not self._running.is_set():
-                            break
-                        try:
-                            self._handle_message(json.loads(raw))
-                        except Exception:
-                            log.debug("Bad Deepgram message", exc_info=True)
+                    keeper = asyncio.ensure_future(self._keepalive())
+                    try:
+                        async for raw in ws:
+                            if not self._running.is_set():
+                                break
+                            try:
+                                self._handle_message(json.loads(raw))
+                            except Exception:
+                                log.debug("Bad Deepgram message", exc_info=True)
+                    finally:
+                        keeper.cancel()
             except Exception as exc:
                 self._connected.clear()
                 self._ws = None
@@ -505,6 +513,24 @@ class DeepgramTranscriber(BaseTranscriber):
                 log.warning("Deepgram connection lost: %s; reconnecting in 2s", exc)
                 self.on_error("Deepgram connection lost, reconnecting...")
                 await asyncio.sleep(2.0)
+
+    def _keyterm_query(self) -> str:
+        """Boost technical jargon in Deepgram's language model.
+
+        Measured: without this, "How would you find the second highest salary
+        in SQL" came back as "...in sequel?", and that is what reached the LLM
+        - so the answer was wrong for a reason that had nothing to do with the
+        model. nova-3 takes repeated `keyterm` parameters; nova-2 and earlier
+        call the same idea `keywords`.
+        """
+        from urllib.parse import quote
+
+        terms = [t.strip() for t in (self.settings.deepgram_keyterms or "").split(",")]
+        terms = [t for t in terms if t][:100]     # Deepgram caps the list
+        if not terms:
+            return ""
+        param = "keyterm" if self.settings.deepgram_model.startswith("nova-3") else "keywords"
+        return "".join("&%s=%s" % (param, quote(t)) for t in terms)
 
     def _handle_message(self, message: dict) -> None:
         channel = message.get("channel") or {}
@@ -534,6 +560,36 @@ class DeepgramTranscriber(BaseTranscriber):
         if message.get("speech_final") and combined:
             self.on_prefinal(combined, uid, -1)
 
+    async def _keepalive(self) -> None:
+        """Hold the socket open through the silence between questions.
+
+        We only stream audio while the VAD hears speech, so on a real call
+        there are long gaps - and Deepgram closes a connection that has been
+        idle for about ten seconds. Reconnecting takes long enough that the
+        first question after a quiet stretch was being lost entirely, which is
+        exactly the question you most want.
+
+        A KeepAlive frame every few seconds costs nothing and is the mechanism
+        Deepgram documents for this.
+        """
+        import json
+        while self._running.is_set():
+            try:
+                await asyncio.sleep(self._KEEPALIVE_SECONDS / 2.0)
+                ws = self._ws
+                if ws is None or not self._running.is_set():
+                    continue
+                if time.monotonic() - self._last_send < self._KEEPALIVE_SECONDS:
+                    continue
+                await ws.send(json.dumps({"type": "KeepAlive"}))
+                self._last_send = time.monotonic()
+                log.debug("Sent Deepgram KeepAlive")
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.debug("KeepAlive failed", exc_info=True)
+                return
+
     async def _shutdown(self) -> None:
         """Close the socket and drop any audio still queued for sending.
 
@@ -557,6 +613,7 @@ class DeepgramTranscriber(BaseTranscriber):
             return
         try:
             await ws.send(payload)
+            self._last_send = time.monotonic()
         except Exception:
             log.debug("Deepgram send failed", exc_info=True)
 

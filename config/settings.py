@@ -82,6 +82,21 @@ class Settings:
     # Deepgram's own end-of-speech detection, milliseconds. Its equivalent of
     # END_OF_UTTERANCE_SILENCE, running server-side on a real streaming model.
     deepgram_endpointing: int = 300
+    # Terms to boost in the language model. Without these, nova-3 hears "SQL"
+    # as "sequel" and "NumPy" as "numpy pie" - which then reach the LLM as the
+    # question, so the answer is wrong for a reason that has nothing to do with
+    # the LLM. Comma-separated; keep it to jargon that is actually misheard.
+    deepgram_keyterms: str = (
+        "SQL,NoSQL,PostgreSQL,MySQL,Redis,Kafka,NumPy,pandas,scikit-learn,"
+        "PyTorch,TensorFlow,Keras,XGBoost,Kubernetes,Docker,Terraform,gRPC,"
+        "GraphQL,REST API,OAuth,JWT,CI/CD,DevOps,Airflow,Spark,Hadoop,"
+        "PySpark,Jupyter,CUDA,GPU,API,JSON,YAML,regex,async,await,"
+        "middleware,microservice,idempotent,ORM,CRUD,schema,index,"
+        "overfitting,underfitting,regularization,gradient descent,"
+        "backpropagation,hyperparameter,cross-validation,precision,recall,"
+        "F1 score,ROC AUC,embedding,transformer,LLM,RAG,inference,latency,"
+        "throughput,big O,time complexity,linked list,binary tree,hash map"
+    )
     partial_interval: float = 0.7         # seconds between partial re-decodes
     # Start decoding the finished-looking utterance this far into a pause,
     # rather than waiting out end_of_utterance_silence first. The decode then
@@ -152,6 +167,7 @@ class Settings:
             deepgram_model=_env("DEEPGRAM_MODEL", "nova-3"),
             deepgram_url=_env("DEEPGRAM_URL", "wss://api.deepgram.com/v1/listen"),
             deepgram_endpointing=_env_int("DEEPGRAM_ENDPOINTING", 300),
+            deepgram_keyterms=_env("DEEPGRAM_KEYTERMS", cls.deepgram_keyterms),
             partial_interval=_env_float("PARTIAL_INTERVAL", 0.7),
             pause_decode_after=_env_float("PAUSE_DECODE_AFTER", 0.20),
             warmup_model=_env_bool("WARMUP_MODEL", True),

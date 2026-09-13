@@ -438,6 +438,37 @@ All numbers below were **measured** on this machine, not estimated:
 - AMD Ryzen 7 PRO 4750U, 8 cores, no GPU used
 - 2.8 second spoken question, `int8` quantisation
 
+### End to end, measured against live APIs
+
+Spoken question → answer text on screen. Nothing stubbed: real speakers, real
+WASAPI loopback capture, real Deepgram, real Groq (`openai/gpt-oss-20b`),
+`ANSWER_MODE=SHORT`, `EAGER_ANSWER=true`.
+
+| Question | First word | Settled |
+|---|---|---|
+| "What is overfitting in machine learning" | 644 ms | 708 ms |
+| "What is the difference between a list and a tuple in Python" | 490 ms | 538 ms |
+| "How would you find the second highest salary in SQL" | **−443 ms** | 968 ms |
+
+A negative number means exactly what it looks like: the answer began appearing
+**before the speaker finished the sentence**. The third question also shows the
+eager trade honestly — it fired early on "How would you find the second
+highest", then re-asked once "salary in SQL" arrived, and settled on correct
+SQL at 968 ms.
+
+Three things had to be fixed to get here, each found by measuring rather than
+reading:
+
+- **The first question of a session took 3.3 s** against ~0.6 s for the rest,
+  purely DNS + TLS handshake. The app now opens the connection at startup.
+- **Deepgram dropped the socket between questions.** Audio only streams while
+  someone is speaking, and Deepgram closes an idle connection after ~10 s, so
+  the first question after a lull was lost while it reconnected. Fixed with
+  KeepAlive frames.
+- **"SQL" came through as "sequel"**, and that is what reached the model — so
+  the answer was wrong for a reason that had nothing to do with the model.
+  Fixed with `DEEPGRAM_KEYTERMS`.
+
 ### The headline number
 
 Speaker stops talking → LLM request on the wire, measured through the real
@@ -546,10 +577,25 @@ URL at them and put their key in `OPENAI_API_KEY`:
 
 ```
 LLM_BASE_URL=https://api.groq.com/openai/v1
-LLM_MODEL=llama-3.1-8b-instant
+LLM_MODEL=openai/gpt-oss-20b
 OPENAI_API_KEY=gsk_...your groq key...
 ```
 
+Measured on Groq, time to the first visible word of the answer:
+
+| Model | First word | Full answer |
+|---|---|---|
+| **`openai/gpt-oss-20b`** | **491 ms** | 657 ms |
+| `groq/compound-mini` | 727 ms | 986 ms |
+| `openai/gpt-oss-120b` | 752 ms | 972 ms |
+| `qwen/qwen3.6-27b` | *393 ms* | 1725 ms |
+
+Ignore that Qwen number — it is fast only because its first token is `<think>`,
+not an answer. The app strips reasoning blocks so you never see them, which
+means a reasoning model simply looks slow here. Avoid them for this job.
+
+Model catalogues change and differ per account; list yours with
+`curl -H "Authorization: Bearer $KEY" https://api.groq.com/openai/v1/models`.
 OpenAI's own fastest is `LLM_MODEL=gpt-4.1-nano` with no base URL.
 
 **2. Eager answering (`EAGER_ANSWER=true`).** Normally the app waits for the

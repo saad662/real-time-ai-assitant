@@ -149,6 +149,13 @@ class Pipeline:
         self._vad.reset()
         self._transcriber.start()
         self._running.set()
+
+        # Open the HTTPS connection to the model now, on a throwaway thread,
+        # so the first real question does not pay for DNS + TLS. Guarded
+        # because `llm` is swappable - tests substitute their own client.
+        warmup = getattr(self.llm, "warmup", None)
+        if callable(warmup):
+            threading.Thread(target=warmup, name="llm-warmup", daemon=True).start()
         self._worker = threading.Thread(target=self._run, name="pipeline", daemon=True)
         self._worker.start()
 

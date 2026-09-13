@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pytest
 
-from ai.client import friendly_error
+from ai.client import ReasoningFilter, friendly_error
 from ai.context import ConversationContext
 from ai.prompts import build_messages, system_prompt
 from audio.capture import resample_to_16k, to_mono
@@ -188,6 +188,47 @@ def test_unsubscribe_stops_delivery():
 ])
 def test_errors_become_readable(message, expected):
     assert expected.lower() in friendly_error(RuntimeError(message)).lower()
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-token filtering
+# ---------------------------------------------------------------------------
+
+def _stream(filt, pieces):
+    return "".join(filt.feed(p) for p in pieces) + filt.flush()
+
+
+def test_plain_text_passes_through_untouched():
+    assert _stream(ReasoningFilter(), ["Over", "fitting ", "is bad."]) == \
+        "Overfitting is bad."
+
+
+def test_think_block_is_removed():
+    out = _stream(ReasoningFilter(),
+                  ["<think>let me reason about this</think>", "Overfitting is bad."])
+    assert out == "Overfitting is bad."
+
+
+def test_think_block_split_across_chunks():
+    """Tokens arrive a few characters at a time, so tags straddle chunks."""
+    out = _stream(ReasoningFilter(),
+                  ["<th", "ink>", "hmm", " maybe", "</th", "ink>", "Answer."])
+    assert out == "Answer."
+
+
+def test_text_before_and_after_a_think_block_is_kept():
+    out = _stream(ReasoningFilter(), ["A", "<think>x</think>", "B"])
+    assert out == "AB"
+
+
+def test_unterminated_think_block_emits_nothing():
+    """A truncated reasoning stream must not dump raw thoughts into the UI."""
+    assert _stream(ReasoningFilter(), ["<think>", "still thinking and then cut"]) == ""
+
+
+def test_angle_brackets_that_are_not_tags_survive():
+    out = _stream(ReasoningFilter(), ["if a < b and c > d then"])
+    assert out == "if a < b and c > d then"
 
 
 def test_unknown_errors_stay_on_one_line():

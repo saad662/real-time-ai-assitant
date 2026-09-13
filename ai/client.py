@@ -31,6 +31,72 @@ class LLMError(RuntimeError):
     """Raised with a message that is safe and useful to show in the UI."""
 
 
+class ReasoningFilter:
+    """Strips <think>...</think> blocks out of a token stream.
+
+    Some models (Qwen's reasoning line, several local builds) put their chain
+    of thought in the normal content stream. Measured on Groq, qwen3.6-27b
+    produced a first token in 172 ms - but that token was "<think>", so the
+    apparent speed was worthless: the actual answer did not start for another
+    1.5 seconds, and the window would have filled with the model talking to
+    itself.
+
+    Tags can be split across chunk boundaries, so a short tail is held back
+    whenever it could be the beginning of one.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+    _HOLD = max(len(OPEN), len(CLOSE)) - 1
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._inside = False
+
+    def feed(self, piece: str) -> str:
+        """Return the part of `piece` that should actually be displayed."""
+        self._buffer += piece
+        out = []
+        while self._buffer:
+            if self._inside:
+                end = self._buffer.find(self.CLOSE)
+                if end == -1:
+                    # Still thinking. Keep only what might start a close tag.
+                    self._buffer = self._buffer[-self._HOLD:] \
+                        if len(self._buffer) > self._HOLD else self._buffer
+                    if not self._could_start(self._buffer, self.CLOSE):
+                        self._buffer = ""
+                    break
+                self._buffer = self._buffer[end + len(self.CLOSE):]
+                self._inside = False
+                continue
+
+            start = self._buffer.find(self.OPEN)
+            if start == -1:
+                if self._could_start(self._buffer[-self._HOLD:], self.OPEN):
+                    out.append(self._buffer[:-self._HOLD])
+                    self._buffer = self._buffer[-self._HOLD:]
+                else:
+                    out.append(self._buffer)
+                    self._buffer = ""
+                break
+            out.append(self._buffer[:start])
+            self._buffer = self._buffer[start + len(self.OPEN):]
+            self._inside = True
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Anything held back at the end of the stream."""
+        if self._inside:
+            return ""
+        tail, self._buffer = self._buffer, ""
+        return tail
+
+    @staticmethod
+    def _could_start(tail: str, tag: str) -> bool:
+        return any(tag.startswith(tail[i:]) and tail[i:] for i in range(len(tail)))
+
+
 class StreamHandle:
     """Returned by `LLMClient.stream()`. Cancel it or wait on it."""
 
@@ -96,6 +162,33 @@ class LLMClient:
             )
         self._ensure_client()
         return "LLM configured: %s" % self.describe()
+
+    def warmup(self) -> None:
+        """Open the HTTPS connection before the first real question.
+
+        Measured end to end, the first question of a session took ~3.3 s
+        against ~0.6 s for the rest, purely because DNS, the TCP handshake and
+        the TLS handshake had not happened yet. One throwaway one-token request
+        at startup moves that cost off the question you actually care about.
+
+        Failures are ignored on purpose: this is an optimisation, and a real
+        request will report any genuine problem properly.
+        """
+        try:
+            client = self._ensure_client()
+            if self.settings.llm_provider == "anthropic":
+                client.messages.create(
+                    model=self.settings.llm_model, max_tokens=1,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            else:
+                client.chat.completions.create(
+                    model=self.settings.llm_model, max_tokens=1,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            log.info("LLM connection warmed up (%s)", self.describe())
+        except Exception as exc:
+            log.debug("LLM warm-up skipped: %s", exc)
 
     def _ensure_client(self):
         with self._client_lock:
@@ -196,6 +289,7 @@ class LLMClient:
             max_tokens=s.llm_max_tokens,
             temperature=0.3,          # low: we want accuracy, not creativity
         )
+        reasoning = ReasoningFilter()
         try:
             for event in stream:
                 if handle.cancelled:
@@ -203,11 +297,16 @@ class LLMClient:
                     break
                 if not event.choices:
                     continue
-                piece = event.choices[0].delta.content or ""
+                piece = reasoning.feed(event.choices[0].delta.content or "")
                 if piece:
                     handle.text += piece
                     if on_chunk:
                         on_chunk(piece, handle.request_id)
+            tail = reasoning.flush()
+            if tail and not handle.cancelled:
+                handle.text += tail
+                if on_chunk:
+                    on_chunk(tail, handle.request_id)
         finally:
             # Closing the stream releases the connection immediately, which is
             # what makes cancellation actually free up the socket.

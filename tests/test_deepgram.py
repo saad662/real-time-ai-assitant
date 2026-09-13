@@ -313,6 +313,43 @@ def test_unreachable_server_reports_an_error_and_keeps_running():
         t.stop()
 
 
+def test_keepalive_holds_the_socket_open_through_silence(server):
+    """Deepgram drops an idle socket after ~10s, and we only stream audio while
+    someone is speaking - so without this the first question after a quiet
+    stretch is lost while the client reconnects."""
+    collector = _Collector()
+    t = DeepgramTranscriber(_settings(server.url), **collector.kwargs())
+    t._KEEPALIVE_SECONDS = 0.3          # keep the test quick
+    t.start()
+    try:
+        assert collector.ready.wait(10)
+        # Send nothing at all, the way a lull between questions looks.
+        assert _wait(lambda: any(json.loads(m).get("type") == "KeepAlive"
+                                 for m in server.received_control), timeout=6), \
+            "no KeepAlive was sent during silence"
+    finally:
+        t.stop()
+
+
+def test_sending_audio_defers_the_keepalive(server):
+    """Audio already keeps the socket alive; a KeepAlive on top is just noise."""
+    collector = _Collector()
+    t = DeepgramTranscriber(_settings(server.url), **collector.kwargs())
+    t._KEEPALIVE_SECONDS = 1.5
+    t.start()
+    try:
+        assert collector.ready.wait(10)
+        t.begin_utterance(1)
+        for _ in range(6):
+            t.feed(_tone(0.05), 1)
+            time.sleep(0.1)
+        keepalives = [m for m in server.received_control
+                      if json.loads(m).get("type") == "KeepAlive"]
+        assert not keepalives, "sent a KeepAlive while audio was flowing"
+    finally:
+        t.stop()
+
+
 def test_begin_utterance_clears_the_previous_transcript(server):
     collector = _Collector()
     t = DeepgramTranscriber(_settings(server.url), **collector.kwargs())
