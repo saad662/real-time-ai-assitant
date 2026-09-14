@@ -19,6 +19,7 @@ Two rules keep the window responsive:
 from __future__ import annotations
 
 import logging
+import threading
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -69,6 +70,7 @@ class MainWindow(QWidget):
     sig_latency = Signal(object)
     sig_error = Signal(object)
     sig_level = Signal(object)
+    sig_models = Signal(object)     # provider model list, fetched off-thread
 
     def __init__(self, settings: Settings, pipeline: Pipeline) -> None:
         super().__init__()
@@ -85,6 +87,10 @@ class MainWindow(QWidget):
         self._install_shortcuts()
         self._install_global_hotkeys()
         self.apply_font_size(settings.font_size)
+
+        if settings.llm_base_url and settings.llm_provider == "openai":
+            threading.Thread(target=self._fetch_provider_models,
+                             name="model-list", daemon=True).start()
 
         self._render_timer = QTimer(self)
         self._render_timer.setInterval(RENDER_INTERVAL_MS)
@@ -155,8 +161,7 @@ class MainWindow(QWidget):
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        self.model_combo.addItems(SUGGESTED_MODELS.get(self.settings.llm_provider, []))
-        self.model_combo.setCurrentText(self.settings.llm_model)
+        self._populate_models()
         self.model_combo.currentTextChanged.connect(self.pipeline.set_model)
         self.model_combo.setToolTip("LLM model (LLM_MODEL in .env)")
         controls2.addWidget(self.model_combo, 2)
@@ -241,6 +246,7 @@ class MainWindow(QWidget):
         self.sig_latency.connect(self._on_latency)
         self.sig_error.connect(self._on_error)
         self.sig_level.connect(self._on_level)
+        self.sig_models.connect(self._apply_provider_models)
 
         routes = {
             ev.StatusEvent: self.sig_status,
@@ -312,6 +318,67 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+    def _populate_models(self) -> None:
+        """Fill the model dropdown with what this provider actually serves.
+
+        The old version listed OpenAI's model names regardless of where the
+        requests were going. With LLM_BASE_URL pointed at Groq, the configured
+        model was not in that list, so the editable combo snapped to its first
+        entry - and every request went out as `gpt-4o-mini`, which Groq
+        rejects. The log showed six failures in a row while `.env` was correct
+        the whole time.
+
+        Now: the configured model is always item 0 and selected by index, and
+        for a custom endpoint the live catalogue is fetched from /models in the
+        background rather than guessed.
+        """
+        s = self.settings
+        combo = self.model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(s.llm_model)
+        if s.llm_base_url:
+            if s.llm_fallback_model and s.llm_fallback_model != s.llm_model:
+                combo.addItem(s.llm_fallback_model)
+        else:
+            for name in SUGGESTED_MODELS.get(s.llm_provider, []):
+                if name != s.llm_model:
+                    combo.addItem(name)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        # The live catalogue fetch is kicked off from __init__, after the
+        # signals are wired - otherwise a fast reply could land before anyone
+        # is listening for it.
+
+    def _fetch_provider_models(self) -> None:
+        """Ask an OpenAI-compatible provider what it serves. Background thread."""
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.settings.openai_api_key,
+                            base_url=self.settings.llm_base_url, timeout=10)
+            names = sorted(
+                m.id for m in client.models.list().data
+                if not any(tag in m.id for tag in ("whisper", "tts", "guard", "orpheus", "embed"))
+            )
+        except Exception as exc:
+            log.info("Could not list provider models (%s); keeping the configured one", exc)
+            return
+        # Queued signal: Qt delivers it on the GUI thread.
+        self.sig_models.emit(names)
+
+    def _apply_provider_models(self, names: list) -> None:
+        combo = self.model_combo
+        current = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(current)
+        for name in names:
+            if name != current:
+                combo.addItem(name)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        log.info("Model dropdown: %d models from %s", combo.count(), self.settings.llm_base_url)
+
     def reload_devices(self) -> None:
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
