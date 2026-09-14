@@ -61,6 +61,11 @@ class Settings:
     # the same wire protocol, they just run on hardware built for low
     # time-to-first-token. Empty means api.openai.com.
     llm_base_url: str = ""
+    # Tried if the primary model fails before producing any output. Providers
+    # have brief outages where one model returns "not available" while the
+    # rest of the catalogue is fine - seen on Groq for ~3 minutes, which in a
+    # live call would have meant three questions with no answer at all.
+    llm_fallback_model: str = ""
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     llm_timeout: float = 30.0
@@ -160,6 +165,7 @@ class Settings:
             llm_provider=_env("LLM_PROVIDER", "openai").lower(),
             llm_model=_env("LLM_MODEL", "gpt-4o-mini"),
             llm_base_url=_env("LLM_BASE_URL"),
+            llm_fallback_model=_env("LLM_FALLBACK_MODEL"),
             openai_api_key=_env("OPENAI_API_KEY"),
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             llm_timeout=_env_float("LLM_TIMEOUT", 30.0),

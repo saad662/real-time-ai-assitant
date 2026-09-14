@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -215,6 +216,10 @@ def cmd_test(settings: Settings) -> int:
             done["flag"] = True
 
     pipeline.bus.subscribe(on_event)
+
+    # The GUI warms the connection when you press Start; do the same here so
+    # the first latency figure is representative rather than a cold handshake.
+    threading.Thread(target=pipeline.llm.warmup, daemon=True).start()
 
     print(_banner(settings))
     print(

@@ -299,6 +299,12 @@ class Pipeline:
         END_OF_UTTERANCE_SILENCE window rather than after it. On this machine
         that takes ~390 ms of Whisper off the critical path entirely.
         """
+        if not getattr(self._transcriber, "supports_prefinal", False):
+            # Streaming providers do their own endpointing and never run a
+            # pause decode. Recording one as pending here made end-of-utterance
+            # wait the full timeout for a result that was never coming - the
+            # "Pause decode did not return in time" warnings in the log.
+            return
         with self._lock:
             uid = self._utterance_id
             self._prefinal = None

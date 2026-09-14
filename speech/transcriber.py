@@ -99,6 +99,11 @@ class BaseTranscriber:
     """
 
     name = "base"
+    # True if transcribe_prefinal actually decodes something. The pipeline
+    # only waits on a pause decode when this is set - otherwise, with a
+    # streaming provider, it would sit for the full timeout on a decode that
+    # was never going to happen.
+    supports_prefinal = False
 
     def __init__(self, settings: Settings, on_partial=None, on_final=None,
                  on_error=None, on_ready=None, on_prefinal=None) -> None:
@@ -125,6 +130,7 @@ class BaseTranscriber:
 
 class LocalWhisperTranscriber(BaseTranscriber):
     name = "faster-whisper"
+    supports_prefinal = True
 
     def __init__(self, settings: Settings, **callbacks) -> None:
         super().__init__(settings, **callbacks)

@@ -1,5 +1,6 @@
 """Configuration, context memory, latency measurement, VAD and error handling."""
 
+import threading
 import time
 
 import numpy as np
@@ -188,6 +189,104 @@ def test_unsubscribe_stops_delivery():
 ])
 def test_errors_become_readable(message, expected):
     assert expected.lower() in friendly_error(RuntimeError(message)).lower()
+
+
+# ---------------------------------------------------------------------------
+# Fallback when the primary model fails
+# ---------------------------------------------------------------------------
+
+class _FlakyClient:
+    """Stands in for the OpenAI SDK: fails N times, then streams normally."""
+
+    class _Delta:
+        def __init__(self, content): self.content = content
+
+    class _Choice:
+        def __init__(self, content): self.delta = _FlakyClient._Delta(content)
+
+    class _Event:
+        def __init__(self, content): self.choices = [_FlakyClient._Choice(content)]
+
+    class _Stream:
+        def __init__(self, pieces, fail_after=None):
+            self._pieces, self._fail_after = pieces, fail_after
+        def __iter__(self):
+            for i, p in enumerate(self._pieces):
+                if self._fail_after is not None and i == self._fail_after:
+                    raise RuntimeError("connection reset mid-stream")
+                yield _FlakyClient._Event(p)
+        def close(self): pass
+
+    def __init__(self, fail_times=0, fail_mid_stream=None):
+        self.fail_times = fail_times
+        self.fail_mid_stream = fail_mid_stream
+        self.models_tried = []
+        self.chat = self
+        self.completions = self
+
+    def create(self, model, **kwargs):
+        self.models_tried.append(model)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("The model `%s` does not exist or is not available" % model)
+        return self._Stream(["Over", "fitting ", "is bad."], self.fail_mid_stream)
+
+
+def _run_stream(settings, client):
+    from ai.client import LLMClient
+    llm = LLMClient(settings)
+    llm._client = client
+    llm._client_provider = "openai"
+    done = threading.Event()
+    result = {"text": "", "error": None}
+    llm.stream(
+        "What is overfitting?",
+        on_chunk=lambda piece, rid: result.__setitem__("text", result["text"] + piece),
+        on_error=lambda msg: result.__setitem__("error", msg),
+        on_done=lambda text, cancelled: done.set(),
+    )
+    assert done.wait(5)
+    return result, client.models_tried
+
+
+def test_transient_failure_retries_the_same_model_once(settings):
+    settings.openai_api_key = "k"
+    settings.llm_model = "primary"
+    result, tried = _run_stream(settings, _FlakyClient(fail_times=1))
+    assert result["error"] is None
+    assert result["text"] == "Overfitting is bad."
+    assert tried == ["primary", "primary"]
+
+
+def test_falls_back_to_the_configured_model(settings):
+    settings.openai_api_key = "k"
+    settings.llm_model = "primary"
+    settings.llm_fallback_model = "backup"
+    result, tried = _run_stream(settings, _FlakyClient(fail_times=1))
+    assert result["error"] is None
+    assert result["text"] == "Overfitting is bad."
+    assert tried == ["primary", "backup"]
+
+
+def test_gives_up_after_the_fallback_fails_too(settings):
+    settings.openai_api_key = "k"
+    settings.llm_model = "primary"
+    settings.llm_fallback_model = "backup"
+    result, tried = _run_stream(settings, _FlakyClient(fail_times=2))
+    assert result["error"] is not None
+    assert result["text"] == ""
+    assert tried == ["primary", "backup"]
+
+
+def test_no_retry_after_output_has_started(settings):
+    """Replaying after visible output would duplicate text on screen."""
+    settings.openai_api_key = "k"
+    settings.llm_model = "primary"
+    settings.llm_fallback_model = "backup"
+    result, tried = _run_stream(settings, _FlakyClient(fail_mid_stream=2))
+    assert result["text"] == "Overfitting "       # what got through
+    assert result["error"] is not None
+    assert tried == ["primary"], "must not retry once text has been shown"
 
 
 # ---------------------------------------------------------------------------

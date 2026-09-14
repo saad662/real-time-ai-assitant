@@ -253,10 +253,7 @@ class LLMClient:
                 if on_start:
                     on_start(handle.request_id)
                 client = self._ensure_client()
-                if self.settings.llm_provider == "anthropic":
-                    self._stream_anthropic(client, messages, handle, on_chunk)
-                else:
-                    self._stream_openai(client, messages, handle, on_chunk)
+                self._stream_with_fallback(client, messages, handle, on_chunk)
             except LLMError as exc:
                 handle.error = str(exc)
                 log.error("LLM request failed: %s", exc)
@@ -264,7 +261,11 @@ class LLMClient:
                     on_error(str(exc))
             except Exception as exc:
                 handle.error = friendly_error(exc)
+                # Both lines on purpose: the friendly one is what the window
+                # shows, the raw one is what you need when diagnosing a
+                # provider outage from the log the next day.
                 log.error("LLM request failed: %s", handle.error)
+                log.error("  raw: %s: %s", type(exc).__name__, str(exc)[:300])
                 log.debug("LLM traceback", exc_info=True)
                 if on_error:
                     on_error(handle.error)
@@ -279,11 +280,50 @@ class LLMClient:
         return handle
 
     # ------------------------------------------------------------------
-    def _stream_openai(self, client, messages, handle: StreamHandle, on_chunk) -> None:
+    def _stream_with_fallback(self, client, messages, handle: StreamHandle, on_chunk) -> None:
+        """Try the primary model; if it fails before saying anything, try again.
+
+        Seen on Groq: one model returned "not available" for about three
+        minutes while the rest of the catalogue was fine. Without this, that
+        was three questions in a row with no answer at all - in a live call.
+
+        The attempt list is [primary, fallback] when LLM_FALLBACK_MODEL is set,
+        otherwise [primary, primary] so a transient 5xx still gets one retry.
+        A retry only happens if *nothing* has been streamed yet: restarting
+        after visible output would duplicate text on screen, and a mid-stream
+        failure is better reported than replayed.
+        """
+        s = self.settings
+        attempts = [s.llm_model, s.llm_fallback_model or s.llm_model]
+        last_exc = None
+        for index, model in enumerate(attempts):
+            try:
+                if s.llm_provider == "anthropic":
+                    self._stream_anthropic(client, messages, handle, on_chunk, model=model)
+                else:
+                    self._stream_openai(client, messages, handle, on_chunk, model=model)
+                return
+            except LLMError:
+                raise                       # configuration problems do not retry
+            except Exception as exc:
+                last_exc = exc
+                if handle.cancelled or handle.text or index == len(attempts) - 1:
+                    raise
+                next_model = attempts[index + 1]
+                log.warning(
+                    "Model %s failed before producing output (%s); retrying with %s",
+                    model, friendly_error(exc), next_model,
+                )
+                time.sleep(0.15)            # brief pause for a transient 5xx
+        if last_exc is not None:
+            raise last_exc
+
+    def _stream_openai(self, client, messages, handle: StreamHandle, on_chunk,
+                       model: str = None) -> None:
         s = self.settings
         started = time.perf_counter()
         stream = client.chat.completions.create(
-            model=s.llm_model,
+            model=model or s.llm_model,
             messages=messages,
             stream=True,
             max_tokens=s.llm_max_tokens,
@@ -317,7 +357,8 @@ class LLMClient:
         log.debug("OpenAI stream finished in %.0f ms (%d chars)",
                   (time.perf_counter() - started) * 1000, len(handle.text))
 
-    def _stream_anthropic(self, client, messages, handle: StreamHandle, on_chunk) -> None:
+    def _stream_anthropic(self, client, messages, handle: StreamHandle, on_chunk,
+                          model: str = None) -> None:
         s = self.settings
         # Anthropic takes the system prompt as a separate argument.
         system = ""
@@ -329,7 +370,7 @@ class LLMClient:
                 chat.append(message)
 
         with client.messages.stream(
-            model=s.llm_model,
+            model=model or s.llm_model,
             system=system,
             messages=chat,
             max_tokens=s.llm_max_tokens,
